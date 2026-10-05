@@ -374,49 +374,6 @@ data/
 ## 使用须知
 
 本项目用于技术学习和个人内容管理，不提供账号、Cookie、代理或平台数据。使用时请遵守目标平台规则及所在地法律法规，并尊重内容版权和个人隐私。
-## 交流群
-
-欢迎加入 **mmm 交流群**，交流使用经验、问题反馈和功能建议。
-
-<table>
-  <tr>
-    <th align="center">扫码加群</th>
-    <th align="center">添加作者微信</th>
-  </tr>
-  <tr>
-    <td align="center">
-      <a href="assets/community/wechat-group.jpg">
-        <img src="assets/community/wechat-group.jpg" alt="mmm 交流群二维码" width="240">
-      </a>
-    </td>
-    <td align="center">
-      <a href="assets/community/wechat-personal.jpg">
-        <img src="assets/community/wechat-personal.jpg" alt="作者个人微信二维码，扫码添加好友" width="240">
-      </a>
-    </td>
-  </tr>
-</table>
-
-<p align="center">
-  使用微信扫描群二维码加入交流群，点击图片可查看原图。
-  入群遇到问题，也可以添加作者微信联系。
-</p>
-
-## 赞助商
-
-<p align="center">
-  <a href="https://www.ipwo.net/?code=PPBFE3E2F" target="_blank" rel="noopener noreferrer">
-    <img src="assets/sponsors/ipwo-banner.png" alt="IPWO 爬虫住宅代理" width="100%">
-  </a>
-</p>
-
-<p align="center">
-  <a href="https://www.ipwo.net/?code=PPBFE3E2F" target="_blank" rel="noopener noreferrer">IPWO</a>
-  提供稳定的住宅代理网络，适用于公开数据采集、接口调试、自动化测试与多地区访问验证等合规场景。
-  支持 HTTP / HTTPS / SOCKS5，优惠码：<code>0201</code>。
-  <br>
-  请在合法授权并遵守目标站点条款的前提下使用。
-</p>
 
 ## 友链
 
