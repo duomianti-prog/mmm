@@ -71,7 +71,7 @@ class ReleaseHelperTests(unittest.TestCase):
     def test_confirmation_pins_head_and_pushes_only_that_tag(self):
         plan = release.plan_release(self.root, "0.2.0", self.git)
         release.publish_plan(self.root, plan, self.git)
-        self.assertIn(("tag", "-a", "v0.2.0", self.head, "-m", "发布 CreatorHub v0.2.0"), self.calls)
+        self.assertIn(("tag", "-a", "v0.2.0", self.head, "-m", "发布 mmm v0.2.0"), self.calls)
         self.assertEqual(self.calls[-1], ("push", "origin", "refs/tags/v0.2.0:refs/tags/v0.2.0"))
         self.assertFalse(any("--force" in args or "--all" in args for args in self.calls))
 

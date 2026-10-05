@@ -537,6 +537,87 @@ class FingerprintChromiumBackendTests(unittest.TestCase):
         self.assertIs(second, context)
         self.assertEqual(manager._launch_persistent.await_count, 1)
 
+    def _launch_kwargs_for(self, identity):
+        class ContextStub:
+            def __init__(self):
+                self.pages = []
+                self.script_calls = []
+
+            async def new_page(self):
+                class Page:
+                    async def evaluate(self, _expression):
+                        return "Mozilla/5.0 Chrome/148.0.0.0 Safari/537.31"
+
+                    async def close(self):
+                        return None
+
+                return Page()
+
+            async def add_init_script(self, value):
+                self.script_calls.append(value)
+
+            async def cookies(self):
+                return []
+
+        class ChromiumStub:
+            def __init__(self):
+                self.kwargs = None
+
+            async def launch_persistent_context(self, **kwargs):
+                self.kwargs = kwargs
+                return ContextStub()
+
+        manager = BrowserManager(
+            "UA", str(Path(self.tmp.name) / "pin-profiles"),
+            fingerprint_chromium_path=str(self.executable),
+        )
+        manager._pw = type("PW", (), {"chromium": ChromiumStub()})()
+        manager._browser_channel = "chrome"
+        asyncio.run(manager._launch_persistent(identity))
+        manager._release_profile_lock(identity.key)
+        return manager._pw.chromium.kwargs
+
+    def test_native_tiktok_context_pins_locale_timezone_proxy(self):
+        identity = Identity(
+            account_id=71,
+            profile_dir=str(Path(self.tmp.name) / "profile-tiktok-71"),
+            platform="tiktok",
+            identity_mode="native",
+            browser_backend="default",
+            fp_seed="tt-71",
+            proxy="http://proxy.fixture:8080",
+            locale="en-US",
+            timezone_id="America/New_York",
+            geo_lat=40.7128,
+            geo_lon=-74.0060,
+            pin_context_locale=True,
+        )
+        kwargs = self._launch_kwargs_for(identity)
+        self.assertEqual(kwargs["locale"], "en-US")
+        self.assertEqual(kwargs["timezone_id"], "America/New_York")
+        self.assertEqual(kwargs["proxy"]["server"], "http://proxy.fixture:8080")
+        self.assertTrue(kwargs["no_viewport"])
+        self.assertAlmostEqual(kwargs["geolocation"]["latitude"], 40.7128)
+        self.assertNotIn("user_agent", kwargs)  # native 不覆盖 UA
+
+    def test_native_douyin_context_still_follows_host_locale(self):
+        identity = Identity(
+            account_id=72,
+            profile_dir=str(Path(self.tmp.name) / "profile-douyin-72"),
+            platform="douyin",
+            identity_mode="native",
+            browser_backend="default",
+            fp_seed="dy-72",
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+        )
+        kwargs = self._launch_kwargs_for(identity)
+        # 未要求绑定语言的平台:native 画像继续跟随宿主系统
+        self.assertNotIn("locale", kwargs)
+        self.assertNotIn("timezone_id", kwargs)
+        self.assertNotIn("geolocation", kwargs)
+        self.assertNotIn("permissions", kwargs)
+
 
 class AccountBrowserBackendApiTests(unittest.TestCase):
     def setUp(self):

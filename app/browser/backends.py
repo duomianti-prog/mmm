@@ -131,7 +131,7 @@ def parse_extra_launch_args(value: str) -> tuple[str, ...]:
 class FingerprintChromiumBackend:
     """Engine-level fingerprint Chromium launched by Patchright.
 
-    The browser owns Canvas/WebGL/Audio/navigator identity.  CreatorHub must
+    The browser owns Canvas/WebGL/Audio/navigator identity.  mmm must
     therefore skip its legacy JavaScript fingerprint injection for this plan.
     """
 

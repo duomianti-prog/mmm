@@ -179,10 +179,17 @@ async def _wait_editor(page, timeout_ms: int) -> bool:
 
 
 async def _primary_publish_button(page):
-    """新版提交控件是 div.button-primary，不是 button。只取精确“发布”。"""
+    """新版提交控件是 div.button-primary，不是 button。只取精确"发布"。
+    候选选择器覆盖多种可能的类名和属性，快手改版时优先在这里增补。"""
     selectors = (
         'div[class*="button-primary"]',
+        'div[class*="btn-primary"]',
+        'div[class*="ButtonPrimary"]',
+        'div[class*="publish-btn"]',
+        '[data-testid*="publish"]',
+        '[data-e2e*="publish"]',
         '[role="button"]',
+        'button[type="submit"]',
         'button',
         'div[class*="publish"]',
     )

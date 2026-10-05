@@ -31,6 +31,13 @@ from ..platforms.douyin import (
     safe_title,
 )
 from ..platforms.douyin.extract import Aweme
+from ..platforms.tiktok import (
+    fetch_tiktok_comments,
+    fetch_tiktok_search,
+    norm_tiktok_work,
+    parse_tiktok_comment,
+    parse_tiktok_item,
+)
 from ..platforms.xhs import (
     XhsApiClient,
     cookie_str_from_state,
@@ -64,6 +71,10 @@ def _author_id(raw: dict, platform: str) -> str:
     if platform == "douyin":
         author = raw.get("author") or {}
         return str(author.get("sec_uid") or author.get("uid") or "")
+    if platform == "tiktok":
+        author = raw.get("author") or {}
+        return str(author.get("secUid") or author.get("sec_uid")
+                   or author.get("uniqueId") or author.get("id") or "")
     card = raw.get("note_card") or raw
     user = card.get("user") or {}
     return str(user.get("user_id") or user.get("userid") or user.get("id") or "")
@@ -72,10 +83,13 @@ def _author_id(raw: dict, platform: str) -> str:
 class KeywordCollector:
     """执行单个持久化采集任务；调度与账号风控由 MonitorEngine 负责。"""
 
-    def __init__(self, cfg, browser, downloader):
+    def __init__(self, cfg, browser, downloader, yield_checker=None):
         self.cfg = cfg
         self.browser = browser
         self.downloader = downloader
+        # callable(account_id) -> True 表示有人工高优任务在等该账号锁,
+        # 采集在关键词/作品边界优雅中断并稍后继续(不产生半成品)。
+        self._yield_checker = yield_checker
 
     async def _xhs_gap(self, seconds: float) -> None:
         base = max(0.0, float(seconds or 0.0))
@@ -83,6 +97,14 @@ class KeywordCollector:
             return
         jitter = min(1.0, max(
             0.0, float(self.cfg.engine.xhs_request_jitter or 0.0)))
+        await asyncio.sleep(base * random.uniform(1.0, 1.0 + jitter))
+
+    async def _tt_gap(self, seconds: float) -> None:
+        base = max(0.0, float(seconds or 0.0))
+        if not base:
+            return
+        jitter = min(1.0, max(
+            0.0, float(self.cfg.engine.tiktok_request_jitter or 0.0)))
         await asyncio.sleep(base * random.uniform(1.0, 1.0 + jitter))
 
     def _xhs_browser_reads_enabled(self) -> bool:
@@ -117,6 +139,29 @@ class KeywordCollector:
     def _cancel_requested(job_id: int) -> bool:
         job = KeywordCollector._job(job_id)
         return not job or job.cancel_requested or job.status == "canceled"
+
+    def _stop_requested(self, job_id: int, account_id) -> str:
+        """取消点:返回 'cancel'(任务被用户取消) / 'yield'(给人工任务让位) / ''。"""
+        if self._cancel_requested(job_id):
+            return "cancel"
+        checker = self._yield_checker
+        if checker is None:
+            return ""
+        try:
+            if bool(checker(account_id)):
+                return "yield"
+        except Exception:
+            return ""
+        return ""
+
+    @staticmethod
+    def _stopped_result(job_id: int, *, yielded: bool = False) -> dict:
+        job = KeywordCollector._job(job_id)
+        return {
+            "canceled": not yielded,  # 让位不是取消:下游会把 yielded 重新排队
+            "yielded": yielded,
+            "errors": job.error_count if job else 0,
+        }
 
     @staticmethod
     def _progress(job_id: int, *, keyword: str | None = None,
@@ -252,6 +297,25 @@ class KeywordCollector:
             block_media=self.cfg.engine.block_media_resources,
         )
         return values[:job.max_contents_per_keyword], error
+
+    async def _discover_tiktok(self, account, keyword: str,
+                               job: KeywordCollectionJob,
+                               context=None) -> tuple[list[dict], str]:
+        identity = self.browser.identity_for(account)
+        return await fetch_tiktok_search(
+            self.browser, identity, keyword, set(),
+            max_results=job.max_contents_per_keyword,
+            max_scrolls=job.max_pages_per_keyword,
+            stagnant_limit=job.stagnant_pages,
+            search_sort=job.search_sort,
+            publish_time=job.publish_time,
+            content_type=job.content_type,
+            min_likes=job.min_likes,
+            min_comments=job.min_comments,
+            captcha_wait_seconds=self.cfg.engine.tiktok_captcha_wait_seconds,
+            block_media=self.cfg.engine.block_media_resources,
+            context=context,
+        )
 
     async def _materialize_xhs(self, client: XhsApiClient, raw: dict) \
             -> tuple[Aweme | None, dict, str]:
@@ -466,6 +530,25 @@ class KeywordCollector:
             parsed = [item for item in parsed if not item.get("reply_to")]
         return self._dedupe_comments(parsed, limit), error
 
+    async def _tiktok_comments(self, account, aweme: Aweme, limit: int,
+                               include_replies: bool,
+                               handle: str = "") -> tuple[list[dict], str]:
+        if limit <= 0:
+            return [], ""
+        identity = self.browser.identity_for(account)
+        raw, error = await fetch_tiktok_comments(
+            self.browser, identity, aweme.aweme_id, set(),
+            handle=handle,
+            max_scrolls=max(2, min(20, math.ceil(limit / 12))),
+            block_media=self.cfg.engine.block_media_resources,
+        )
+        parsed = [item for item in
+                  (parse_tiktok_comment(value) for value in raw) if item]
+        # 当前适配只抓顶级评论;reply_to 归一后均为顶级,过滤仅为语义对齐。
+        if not include_replies:
+            parsed = [item for item in parsed if not item.get("reply_to")]
+        return self._dedupe_comments(parsed, limit), error
+
     @staticmethod
     def _dedupe_comments(values: list[dict], limit: int) -> list[dict]:
         found: dict[str, dict] = {}
@@ -526,7 +609,7 @@ class KeywordCollector:
                 douyin_cookie_from_state(account.storage_state), identity.ua,
                 timeout=self.cfg.engine.request_timeout_seconds, proxy=proxy,
                 **douyin_client_environment(identity))
-        elif not self._xhs_browser_reads_enabled():
+        elif job.platform == "xhs" and not self._xhs_browser_reads_enabled():
             cookie = cookie_str_from_state(account.storage_state)
             if not has_a1(cookie):
                 raise RuntimeError("小红书登录态缺少 a1，请重新扫码登录")
@@ -558,6 +641,14 @@ class KeywordCollector:
                     return await self._run_keywords(
                         job_id, job, account, keywords, proxy,
                         douyin_client=douyin_client, context=context)
+        if job.platform == "tiktok":
+            # 搜索是 TikTok 风控高发场景:复用一次临时有头 context,
+            # 人机校验时用户可直接在弹窗里完成验证后自动续跑。
+            self._progress(job_id, step="启动 TikTok 可见采集窗口")
+            async with self.browser.temporary_headed_context(identity) as context:
+                return await self._run_keywords(
+                    job_id, job, account, keywords, proxy,
+                    context=context, identity=identity)
         if xhs_client is not None:
             async with xhs_client.session_scope():
                 return await self._run_keywords(
@@ -575,8 +666,11 @@ class KeywordCollector:
 
         browser_reads = self._xhs_browser_reads_enabled()
         for keyword_index, keyword in enumerate(keywords):
-            if self._cancel_requested(job_id):
+            stop = self._stop_requested(job_id, account.id)
+            if stop == "cancel":
                 return {"canceled": True, "errors": self._job(job_id).error_count}
+            if stop == "yield":
+                return self._stopped_result(job_id, yielded=True)
             if job.platform == "douyin" and keyword_index:
                 gap = max(0.0, float(self.cfg.engine.douyin_keyword_gap_seconds))
                 if gap:
@@ -584,11 +678,17 @@ class KeywordCollector:
             elif job.platform == "xhs" and keyword_index:
                 await self._xhs_gap(
                     self.cfg.engine.xhs_keyword_gap_seconds)
+            elif job.platform == "tiktok" and keyword_index:
+                await self._tt_gap(
+                    self.cfg.engine.tiktok_keyword_gap_seconds)
             self._progress(job_id, keyword=keyword, step="搜索作品")
             if job.platform == "douyin":
                 raw_items, search_error = await self._discover_douyin(
                     account, keyword, job, client=douyin_client,
                     context=context)
+            elif job.platform == "tiktok":
+                raw_items, search_error = await self._discover_tiktok(
+                    account, keyword, job, context=context)
             elif browser_reads:
                 raw_items, search_error = await self._discover_xhs_browser(
                     identity, keyword, job)
@@ -608,8 +708,11 @@ class KeywordCollector:
                 continue
 
             for index, raw in enumerate(raw_items[:job.max_contents_per_keyword], 1):
-                if self._cancel_requested(job_id):
+                stop = self._stop_requested(job_id, account.id)
+                if stop == "cancel":
                     return {"canceled": True, "errors": self._job(job_id).error_count}
+                if stop == "yield":
+                    return self._stopped_result(job_id, yielded=True)
                 self._progress(
                     job_id, keyword=keyword,
                     step=f"处理作品 {index}/{min(len(raw_items), job.max_contents_per_keyword)}")
@@ -626,6 +729,30 @@ class KeywordCollector:
                             author_name=author.get("nickname") or "",
                             media_type="images" if raw.get("images") else "video",
                         )
+                        detail_error = "未取得媒体地址"
+                    token = ""
+                elif job.platform == "tiktok":
+                    aweme = parse_tiktok_item(raw, job.video_quality or "highest")
+                    tt_handle = str(
+                        (raw.get("author") or {}).get("uniqueId") or "")
+                    if aweme is None and str(raw.get("id") or "").strip().isdigit():
+                        # 搜索条目缺媒体地址(区域限制/登录墙降级)时保留元数据,
+                        # 与抖音同样以"未取得媒体地址"入库,不丢这条结果。
+                        meta = norm_tiktok_work(raw) or {}
+                        tt_author = raw.get("author") or {}
+                        aweme = Aweme(
+                            aweme_id=str(raw.get("id")),
+                            desc=(raw.get("desc") or "").strip(),
+                            create_time=int(raw.get("createTime")
+                                           or raw.get("create_time") or 0),
+                            author_name=tt_author.get("nickname")
+                            or tt_author.get("uniqueId") or "",
+                            media_type=meta.get("media_type") or "video",
+                        )
+                        aweme.platform = "tiktok"
+                        aweme.cover = meta.get("cover_url") or ""
+                        aweme.like_count = meta.get("like_count") or 0
+                        aweme.comment_count = meta.get("comment_count") or 0
                         detail_error = "未取得媒体地址"
                     token = ""
                 elif browser_reads:
@@ -675,6 +802,11 @@ class KeywordCollector:
                             account, douyin_client, aweme,
                             job.max_comments_per_content, job.include_replies,
                             context=context)
+                    elif job.platform == "tiktok":
+                        comments, comment_error = await self._tiktok_comments(
+                            account, aweme,
+                            job.max_comments_per_content, job.include_replies,
+                            handle=tt_handle)
                     elif browser_reads:
                         comments, comment_error = await self._xhs_comments_browser(
                             identity, aweme.aweme_id, token,
@@ -696,6 +828,8 @@ class KeywordCollector:
                 self._refresh_counts(job_id)
                 if job.platform == "xhs":
                     await self._xhs_gap(self.cfg.engine.xhs_item_gap_seconds)
+                elif job.platform == "tiktok":
+                    await self._tt_gap(self.cfg.engine.tiktok_item_gap_seconds)
                 else:
                     await asyncio.sleep(0.4)
 

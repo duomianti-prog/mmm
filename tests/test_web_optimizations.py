@@ -8,7 +8,7 @@ import pytest
 
 
 @pytest.mark.parametrize("zone", ["Asia/Shanghai", "America/New_York"])
-@pytest.mark.parametrize("script", ["web_optimizations.cjs", "web_submissions.cjs", "web_appearance.cjs", "web_engine_settings.cjs", "web_monitor_intervals.cjs", "web_content_provenance.cjs", "web_watch_provenance.cjs", "web_preview.cjs", "web_douyin_dm.cjs"])
+@pytest.mark.parametrize("script", ["web_optimizations.cjs", "web_submissions.cjs", "web_appearance.cjs", "web_engine_settings.cjs", "web_monitor_intervals.cjs", "web_content_provenance.cjs", "web_watch_provenance.cjs", "web_preview.cjs", "web_douyin_dm.cjs", "douyin_comment_reply_match.cjs", "tiktok_comment_reply_match.cjs", "web_channels_caps.cjs"])
 def test_ui_behavior_offline(zone, script):
     node = shutil.which("node")
     if node is None:

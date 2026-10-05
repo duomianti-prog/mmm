@@ -56,7 +56,11 @@ class NativeWriteSafetyTests(unittest.TestCase):
             exit_checked_at=None,
         )
 
-        self.assertIn("系统稳定版 Chrome", manager.native_write_gate_error(account))
+        self.assertIn("未检测到可用浏览器内核", manager.native_write_gate_error(account))
+        # bundled Chromium（Patchright 自带）与系统 Chrome 等价，应放行
+        manager._bundled_chromium_ok = True
+        self.assertIn("尚未通过", manager.native_write_gate_error(account))
+        manager._bundled_chromium_ok = False
         manager._browser_channel = "chrome"
         self.assertIn("尚未通过", manager.native_write_gate_error(account))
 

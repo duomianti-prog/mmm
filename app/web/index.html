@@ -3,9 +3,101 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CreatorHub</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='1.2' y='1.2' width='21.6' height='21.6' rx='5.6' fill='%231d1d1f'/%3E%3Ctext x='12' y='15.8' text-anchor='middle' font-family='Arial,Helvetica,sans-serif' font-size='8.6' font-weight='800' fill='%23ffffff'%3Emmm%3C/text%3E%3C/svg%3E">
+<title>mmm</title>
+<script>
+// 自定义品牌：有 data/branding/logo.* 与 name.txt 时覆盖默认 Logo / 产品名。
+window.__applyBranding = function (b) {
+  if (!b) return;
+  if (b.name) {
+    document.title = b.name;
+    var h1 = document.querySelector('.brand-copy h1');
+    if (h1) h1.textContent = b.name;
+  }
+  if (b.logo) {
+    var mark = document.querySelector('.brand-mark');
+    if (mark && !mark.querySelector('img')) {
+      mark.innerHTML = '<img src="' + b.logo + '" alt="" style="width:100%;height:100%;object-fit:contain;display:block">';
+    }
+  }
+};
+document.addEventListener('DOMContentLoaded', function () {
+  fetch('/api/branding').then(function (r) { return r.ok ? r.json() : null; })
+    .then(window.__applyBranding).catch(function () {});
+});
+</script>
+<style>
+  #license-banner{display:flex;align-items:center;gap:10px;margin:0 0 16px;padding:10px 14px;border:1px solid #f0c36d;background:#fdf3e0;color:#8a5300;border-radius:12px;font-size:13px;line-height:1.5}
+  #license-banner b{font-weight:700}
+  html[data-theme="dark"] #license-banner{background:#33291a;border-color:#6b5326;color:#e8c483}
+  #license-banner .lic-banner-x{margin-left:auto;background:none;border:0;color:inherit;cursor:pointer;font-size:16px;line-height:1;padding:2px 4px}
+  .lic-fp-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .lic-fp-row code{font-size:12px;word-break:break-all}
+</style>
+<script>
+// 授权状态：到期前提醒横幅 + 设置页授权信息。授权失效时由服务端拦截页接管，不会进入此页面。
+(function () {
+  function fmtDate(ts) {
+    if (!ts) return '—';
+    var d = new Date(ts * 1000);
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  }
+  function apply(info) {
+    if (!info) return;
+    var banner = document.getElementById('license-banner');
+    var text = document.getElementById('license-banner-text');
+    if (banner && text && info.status === 'valid' && !info.perpetual && info.renew_soon) {
+      text.innerHTML = '授权将于 <b>' + fmtDate(info.expire_at) + '</b> 到期（剩余 ' + info.days_remaining + ' 天），请提前联系服务人员续期，以免影响使用。';
+      banner.dataset.needsShow = '1';
+      var cur = (document.querySelector('.navitem.active') || {}).dataset || {};
+      var tab = cur.tab || 'overview';
+      banner.hidden = (tab !== 'overview' && tab !== 'accounts');
+    }
+    var map = {
+      'lic-status': info.status === 'valid' ? (info.perpetual ? '有效（永久授权）' : '有效') : info.status_text || info.status,
+      'lic-customer': info.customer || '—',
+      'lic-expire': info.perpetual ? '永久' : fmtDate(info.expire_at),
+      'lic-days': info.perpetual ? '—' : (info.days_remaining == null ? '—' : info.days_remaining + ' 天'),
+      'lic-fingerprint': info.fingerprint || '—'
+    };
+    Object.keys(map).forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.textContent = map[id];
+    });
+  }
+  function poll() {
+    fetch('/api/license/status', { headers: { 'Accept': 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(apply).catch(function () {});
+  }
+  document.addEventListener('DOMContentLoaded', function () {
+    poll();
+    setInterval(poll, 5 * 60 * 1000);
+    var close = document.getElementById('license-banner-close');
+    if (close) close.addEventListener('click', function () {
+      var banner = document.getElementById('license-banner');
+      if (banner) { banner.hidden = true; banner.dataset.needsShow = ''; }
+    });
+    var copyBtn = document.getElementById('lic-copy-fp');
+    if (copyBtn) copyBtn.addEventListener('click', function () {
+      var fp = document.getElementById('lic-fingerprint');
+      if (!fp) return;
+      navigator.clipboard.writeText(fp.textContent).then(function () {
+        copyBtn.textContent = '已复制';
+        setTimeout(function () { copyBtn.textContent = '复制指纹'; }, 1500);
+      }).catch(function () {});
+    });
+  });
+})();
+</script>
 <meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#f5f5f7">
+<meta name="theme-color" content="#1d1d1f" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="客服坐席">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="/cs-manifest.json">
 <script src="/static/appearance.js"></script>
 <!-- System fonts render immediately, including when the workbench is offline. -->
 <style>
@@ -88,6 +180,7 @@
   .pswitch button.active[data-pf="xhs"] { background:var(--xhs-soft); color:var(--xhs); border-color:var(--xhs-ring); }
   .pswitch button.active[data-pf="kuaishou"] { background:rgba(255,121,2,.16); color:#ff7902; border-color:rgba(255,121,2,.4); }
   .pswitch button.active[data-pf="shipinhao"] { background:rgba(7,193,96,.16); color:#07c160; border-color:rgba(7,193,96,.4); }
+  .pswitch button.active[data-pf="tiktok"] { background:rgba(255,255,255,.14); color:#f2f2f2; border-color:rgba(255,255,255,.42); }
   .hidden { display:none !important; }
 
   /* Platform accents and light/dark themes are independent: appearance.css. */
@@ -1436,6 +1529,9 @@
   .platform-callout > svg { width:17px; height:17px; flex:0 0 auto; margin-top:1px; color:var(--info); }
   .platform-callout b { color:var(--fg); font-weight:600; }
   .platform-callout p { margin:2px 0 0; }
+  .sh-only-inline { display:none; }
+  body.pf-channels .sh-only-inline { display:inline; }
+  body.pf-channels .notsh-inline { display:none; }
   .kpi-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:14px; }
   .kpi-card { min-width:0; padding:13px 14px; background:var(--bg); border:1px solid var(--line-soft); border-radius:var(--r-sm); }
   .kpi-label { color:var(--mut); font-size:11.5px; font-weight:550; }
@@ -1724,7 +1820,7 @@
 
 <!-- icon sprite -->
 <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false" data-icon-set="lucide">
-  <symbol id="i-brand" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><circle cx="11" cy="11" r="2.5"/></symbol>
+  <symbol id="i-brand" viewBox="0 0 24 24" fill="none"><rect x="1.2" y="1.2" width="21.6" height="21.6" rx="5.6" fill="#1d1d1f" stroke="#ffffff" stroke-opacity="0.22" stroke-width="0.8"/><text x="12" y="15.6" text-anchor="middle" textLength="16.4" lengthAdjust="spacingAndGlyphs" font-family="Arial, Helvetica, sans-serif" font-size="8.6" font-weight="800" fill="#ffffff" letter-spacing="-0.6">mmm</text></symbol>
   <symbol id="i-more" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1" /> <circle cx="19" cy="12" r="1" /> <circle cx="5" cy="12" r="1" /></symbol>
   <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" /> <path d="M21 3v5h-5" /> <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" /> <path d="M8 16H3v5" /></symbol>
   <symbol id="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4" /> <path d="M12 2v2" /> <path d="M12 20v2" /> <path d="m4.93 4.93 1.41 1.41" /> <path d="m17.66 17.66 1.41 1.41" /> <path d="M2 12h2" /> <path d="M20 12h2" /> <path d="m6.34 17.66-1.41 1.41" /> <path d="m19.07 4.93-1.41 1.41" /></symbol>
@@ -1794,7 +1890,7 @@
   <div class="brand">
     <span class="brand-mark" aria-hidden="true"><svg><use href="#i-brand"/></svg></span>
     <div class="brand-copy">
-      <h1>CreatorHub<span class="badge-lite">LITE</span></h1>
+      <h1>mmm<span class="badge-lite">LITE</span></h1>
       <span class="brand-sub">多平台内容工作台</span>
     </div>
   </div>
@@ -1823,18 +1919,20 @@
   <nav class="nav" aria-label="主导航">
     <button class="navitem" data-tab="overview" onclick="switchTab('overview', true)"><svg><use href="#i-overview"/></svg><span class="nav-label">工作概览</span></button>
     <button class="navitem" data-tab="accounts" onclick="switchTab('accounts', true)"><svg><use href="#i-card"/></svg><span class="nav-label">平台账号</span><span class="nav-badge" id="tb-acc">0</span></button>
-    <button class="navitem notsh-only" data-tab="monitors" onclick="switchTab('monitors', true)"><svg><use href="#i-target"/></svg><span class="nav-label">作品监控</span><span class="nav-badge" id="tb-mon">0</span></button>
+    <button class="navitem notsh-only" data-tab="monitors" data-cap="work_monitor" onclick="switchTab('monitors', true)"><svg><use href="#i-target"/></svg><span class="nav-label">作品监控</span><span class="nav-badge" id="tb-mon">0</span></button>
     <button class="navitem collect-only" data-tab="collections" onclick="switchTab('collections', true)"><svg><use href="#i-hash"/></svg><span class="nav-label">关键词采集</span><span class="nav-badge" id="tb-col">0</span></button>
-    <button class="navitem notsh-only" data-tab="comments" onclick="switchTab('comments', true)"><svg><use href="#i-msg"/></svg><span class="nav-label">评论监控</span><span class="nav-badge" id="tb-watch">0</span></button>
+    <button class="navitem notsh-only" data-tab="comments" data-cap="comment_monitor" onclick="switchTab('comments', true)"><svg><use href="#i-msg"/></svg><span class="nav-label">评论监控</span><span class="nav-badge" id="tb-watch">0</span></button>
     <button class="navitem dy-only" data-tab="danmaku" onclick="switchTab('danmaku', true)"><svg><use href="#i-captions"/></svg><span class="nav-label">弹幕监控</span><span class="nav-badge" id="tb-danmaku">0</span></button>
     <div class="nav-sep">本账号</div>
-    <button class="navitem" data-tab="hub" onclick="switchTab('hub', true)"><svg><use href="#i-library"/></svg><span class="nav-label">我的内容</span></button>
+    <button class="navitem" data-tab="hub" data-cap="own_works" onclick="switchTab('hub', true)"><svg><use href="#i-library"/></svg><span class="nav-label">我的内容</span></button>
     <div class="nav-sep">工具</div>
     <button class="navitem" data-tab="queue" onclick="switchTab('queue', true)"><svg><use href="#i-list"/></svg><span class="nav-label">任务队列</span><span class="nav-badge" id="tb-queue">0</span></button>
     <button class="navitem pub-only" data-tab="publish" onclick="switchTab('publish', true)"><svg><use href="#i-send"/></svg><span class="nav-label">发布</span><span class="nav-badge" id="tb-pub">0</span></button>
-    <button class="navitem notsh-only" data-tab="autocomment" onclick="switchTab('autocomment', true)"><svg><use href="#i-automation"/></svg><span class="nav-label">自动评论</span><span class="nav-badge" id="tb-ac">0</span></button>
-    <button class="navitem" data-tab="share-download" onclick="switchTab('share-download', true)"><svg><use href="#i-download"/></svg><span class="nav-label">链接下载</span></button>
+    <button class="navitem notsh-only" data-tab="autocomment" data-cap="auto_comment" onclick="switchTab('autocomment', true)"><svg><use href="#i-automation"/></svg><span class="nav-label">自动评论</span><span class="nav-badge" id="tb-ac">0</span></button>
+    <button class="navitem" data-tab="share-download" data-cap="link_download" onclick="switchTab('share-download', true)"><svg><use href="#i-download"/></svg><span class="nav-label">链接下载</span></button>
     <button class="navitem" data-tab="notifications" onclick="switchTab('notifications', true)"><svg><use href="#i-bell"/></svg><span class="nav-label">通知</span></button>
+    <button class="navitem" data-tab="cs" data-cap="dm" onclick="switchTab('cs', true)"><svg><use href="#i-msg"/></svg><span class="nav-label">客服接待</span><span class="nav-badge" id="tb-cs" hidden>0</span></button>
+    <button class="navitem" data-tab="cs-settings" data-cap="dm" onclick="switchTab('cs-settings', true)"><svg><use href="#i-settings"/></svg><span class="nav-label">客服设置</span></button>
     <button class="navitem" data-tab="settings" onclick="switchTab('settings', true)"><svg><use href="#i-settings"/></svg><span class="nav-label">设置</span></button>
     <div class="nav-sep">安全</div>
     <button class="navitem" data-tab="risk-control" onclick="switchTab('risk-control', true)"><svg><use href="#i-shield"/></svg><span class="nav-label">风控中心</span><span class="nav-badge" id="tb-risk">0</span></button>
@@ -1847,6 +1945,11 @@
       <h2 id="page-title" tabindex="-1">总览</h2>
       <p class="page-desc" id="page-desc">查看账号、监控、作品与评论的最新状态。</p>
     </div>
+  </div>
+  <div id="license-banner" role="status" hidden>
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+    <span id="license-banner-text"></span>
+    <button type="button" id="license-banner-close" class="lic-banner-x" aria-label="关闭提醒">&times;</button>
   </div>
   <section data-panel="overview">
   <section class="stats" aria-label="概览统计">
@@ -1898,7 +2001,7 @@
   </div>
   <div class="platform-callout" role="note">
     <svg aria-hidden="true"><use href="#i-info"/></svg>
-    <div><b>平台数据彼此独立</b><p>切换平台后，账号、监控与评论数据会独立展示；通知和下载设置全局共用。视频号仅提供本账号作品、数据与发布，其余能力以导航中可见入口为准。</p></div>
+    <div><b>平台数据彼此独立</b><p>切换平台后，账号、监控与评论数据会独立展示；通知和下载设置全局共用。<span class="sh-only-inline" style="display:none;color:var(--warn)">视频号助手仅提供本账号作品、数据、发布与本账号评论回复，不提供他人作品监控、他人评论、关键词采集与主动私信入口，故相关导航已隐藏。</span><span class="notsh-inline">其余能力以导航中可见入口为准。</span></p></div>
   </div>
   </section>
 
@@ -1920,6 +2023,8 @@
         <button class="ghost ks-only" onclick="startKsCreatorLogin()" title="普通快手扫码登录已可用于发布；仅在创作平台仍提示登录时使用"><svg><use href="#i-send"/></svg>创作平台登录（备用）</button>
         <button class="ghost ks-only" onclick="toggleCookie()">Cookie 粘贴</button>
         <button class="sh-only" onclick="startChannelsLogin()"><svg><use href="#i-login"/></svg>视频号登录</button>
+        <button class="tt-only" onclick="startTiktokLogin()"><svg><use href="#i-login"/></svg>TikTok 网页登录</button>
+        <button class="ghost tt-only" onclick="toggleCookie()">Cookie 粘贴</button>
       </div>
       <div id="qrbox" style="display:none;margin-bottom:14px">
         <div class="mut" id="qrstatus">准备中…</div>
@@ -2145,7 +2250,7 @@
     <div class="card">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-hash"/></svg></span>
-        <h2>新建抖音关键词采集 <span class="sub">批量搜索视频并抓取评论</span></h2>
+        <h2>新建关键词采集 <span class="sub">批量搜索作品并抓取评论</span></h2>
       </div>
       <div class="stack">
         <div class="form-field">
@@ -2465,7 +2570,185 @@
     </div>
   </section>
 
+  <section data-panel="cs">
+  <style>
+    .cs-login-wrap{max-width:420px;margin:24px auto}
+    .cs-login-wrap label{display:block;margin:12px 0;font-weight:600}
+    .cs-login-wrap input{width:100%;margin-top:6px}
+    .cs-login-err{color:#c71f46;font-size:13px;margin-left:10px}
+    .cs-toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+    .cs-filters{display:flex;gap:6px;flex-wrap:wrap}
+    .cs-filters button b{font-weight:800;margin-left:3px}
+    .cs-filters button.on{background:#1d1d1f;color:#fff;border-color:#1d1d1f}
+    .cs-tools{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .cs-me{font-size:13px;color:#666}
+    .cs-me b{color:#1d1d1f}
+    .cs-wrap{display:grid;grid-template-columns:320px 1fr;gap:12px;min-height:560px;height:calc(100vh - 230px)}
+    @media(max-width:900px){
+      .cs-wrap{grid-template-columns:1fr;height:calc(100vh - 200px);min-height:0;gap:0}
+      .cs-list{max-height:none;height:100%;border-radius:0}
+      .cs-main{display:none;border-radius:0;min-height:0;height:100%}
+      .cs-wrap.cs-conv-open .cs-list{display:none}
+      .cs-wrap.cs-conv-open .cs-main{display:flex}
+      .cs-chat-head{position:sticky;top:0;background:#fff;z-index:2}
+      .cs-back-btn{display:inline-flex !important}
+      .cs-toolbar{gap:6px}
+      .cs-filters button{padding:5px 9px;font-size:12px}
+      .cs-login-wrap{margin:12px}
+    }
+    .cs-back-btn{display:none;border:none;background:#f2f2f7;border-radius:8px;padding:4px 10px;font-size:13px;cursor:pointer;margin-right:4px}
+    .cs-back-btn:hover{background:#e5e5ea}
+    .cs-list{background:#fff;border:1px solid var(--line,#e5e5ea);border-radius:12px;overflow-y:auto}
+    .cs-conv{padding:11px 13px;border-bottom:1px solid #eee;cursor:pointer;display:flex;gap:9px;align-items:center}
+    .cs-conv:hover{background:#f7f7fa}
+    .cs-conv.active{background:#eef1ff}
+    .cs-conv .dot{width:9px;height:9px;border-radius:50%;flex:none;margin-top:5px}
+    .cs-conv .dot.queued{background:#ff9500}.cs-conv .dot.active{background:#30d158}.cs-conv .dot.closed{background:#c7c7cc}
+    .cs-conv .meta{min-width:0;flex:1}
+    .cs-conv .meta b{display:flex;gap:6px;align-items:center;font-size:14px}
+    .cs-conv .meta .last{color:#888;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+    .cs-conv .meta .acc-line{display:flex;gap:6px;align-items:center;margin-top:3px}
+    .cs-conv .meta .acc-ctx{font-size:11px;color:#999;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .cs-conv .badge-src{font-size:10px;font-weight:600;background:#eef0f4;color:#555;border-radius:5px;padding:1px 5px;flex:none}
+    .cs-conv .cs-conv-close{flex:none;padding:2px 6px;opacity:.6}
+    .cs-conv:hover .cs-conv-close{opacity:1}
+    .cs-main{display:flex;flex-direction:column;background:#fff;border:1px solid var(--line,#e5e5ea);border-radius:12px;overflow:hidden;min-height:420px}
+    .cs-chat-head{padding:10px 14px;border-bottom:1px solid #eee;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .cs-chat-head .who{font-weight:700;font-size:14px;min-width:0}
+    .cs-chat-head .sub{color:#888;font-size:12px}
+    .cs-chat-head .acts{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
+    .cs-thread{flex:1;overflow-y:auto;padding:14px;background:#f7f8fa}
+    .cs-bubble{max-width:78%;margin-bottom:10px;padding:8px 12px;border-radius:14px;font-size:14px;line-height:1.55;
+      white-space:pre-wrap;word-break:break-word;box-shadow:0 1px 2px rgba(0,0,0,.05)}
+    .cs-bubble.in{background:#fff;border-bottom-left-radius:5px}
+    .cs-bubble.out{background:#1d1d1f;color:#fff;margin-left:auto;border-bottom-right-radius:5px}
+    .cs-bubble .t{display:block;font-size:10px;opacity:.55;margin-top:3px;text-align:right}
+    .cs-bubble .who{display:block;font-size:11px;opacity:.7;margin-bottom:2px}
+    .cs-sys{text-align:center;margin:10px auto;color:#777;font-size:12px}
+    .cs-sys span{background:rgba(120,120,128,.14);padding:3px 11px;border-radius:999px}
+    .cs-relaytag{font-size:11px;font-weight:600}
+    .cs-relaytag.ok{color:#30d158}.cs-relaytag.wait{color:#ff9500}.cs-relaytag.fail{color:#ff453a}
+    .cs-resend-btn{font-size:11px;font-weight:600;color:#fff;background:#ff453a;border:none;border-radius:5px;padding:1px 7px;cursor:pointer;margin-left:4px;vertical-align:middle}
+    .cs-resend-btn:hover{background:#e03e33}
+    .cs-composer{display:flex;gap:8px;padding:10px;border-top:1px solid #eee;align-items:flex-end}
+    .cs-composer textarea{flex:1;resize:none;max-height:110px;border:1px solid #ddd;border-radius:12px;padding:8px 12px;font:inherit;font-size:14px}
+    .cs-modal{position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:9000;display:flex;align-items:center;justify-content:center;padding:20px}
+    .cs-modal-box{background:#fff;border-radius:14px;max-width:520px;width:100%;max-height:84vh;overflow-y:auto;padding:22px}
+    .cs-modal-box h3{margin-bottom:14px}
+    .cs-agent-row{display:flex;align-items:center;gap:10px;padding:9px 4px;border-bottom:1px solid #f0f0f0}
+    .cs-agent-row .grow{flex:1;min-width:0}
+    .cs-agent-row .grow b{font-size:14px}.cs-agent-row .grow .sub{color:#888;font-size:12px}
+    .cs-link-box{display:flex;gap:8px;margin:14px 0}
+    .cs-link-box input{flex:1;min-width:0}
+  </style>
+
+  <div class="card cs-login-wrap" id="cs-login-card">
+    <div class="card-head">
+      <span class="card-ic"><svg aria-hidden="true"><use href="#i-user"/></svg></span>
+      <h2>客服坐席登录 <span class="sub">接待访客链接与平台转人工会话</span></h2>
+    </div>
+    <div class="hint">首个坐席账号需在服务器执行 <code>python -m app.cs_admin create-agent 用户名 密码 --admin</code> 创建。登录态保留 7 天。</div>
+    <label>客服服务器<input id="cs-server" placeholder="留空 = 本机；远程填 http://服务器IP:8080"></label>
+    <label>用户名<input id="cs-login-user" autocomplete="username" placeholder="请输入用户名"></label>
+    <label>密码<input id="cs-login-pass" type="password" autocomplete="current-password" placeholder="请输入密码" onkeydown="if(event.key==='Enter')csLogin()"></label>
+    <div class="form-actions">
+      <button type="button" onclick="csLogin()">登录</button>
+      <span class="cs-login-err" id="cs-login-err"></span>
+    </div>
+  </div>
+
+  <div id="cs-app" style="display:none">
+    <div class="cs-toolbar">
+      <div class="cs-filters" id="cs-filters">
+        <button class="ghost sm on" data-csfilter="queued" onclick="csSetFilter('queued')">排队 <b id="cs-c-q">0</b></button>
+        <button class="ghost sm" data-csfilter="active" onclick="csSetFilter('active')">进行中 <b id="cs-c-a">0</b></button>
+        <button class="ghost sm" data-csfilter="" onclick="csSetFilter('')">全部</button>
+        <button class="ghost sm" data-csfilter="closed" onclick="csSetFilter('closed')">已关闭</button>
+        <select id="cs-source-filter" class="ghost sm" onchange="csApplyFilters()">
+          <option value="">全部来源</option>
+          <option value="guest">访客链接</option>
+          <option value="douyin_dm">抖音私信</option>
+          <option value="douyin_comment">抖音评论</option>
+          <option value="xhs_dm">小红书私信</option>
+          <option value="xhs_comment">小红书评论</option>
+          <option value="tiktok_dm">TikTok 私信</option>
+        </select>
+        <label class="ghost sm" style="display:inline-flex;align-items:center;gap:4px;cursor:pointer">
+          <input type="checkbox" id="cs-unread-only" onchange="csApplyFilters()"> 仅未读
+        </label>
+      </div>
+      <div class="cs-tools">
+        <span class="cs-me" id="cs-me"></span>
+        <button class="ghost sm" id="cs-admin-btn" type="button" onclick="csOpenAdmin()"><svg><use href="#i-settings"/></svg>坐席管理</button>
+        <button class="sm" type="button" onclick="csCreateLink()"><svg><use href="#i-plus"/></svg>新建访客链接</button>
+        <button class="ghost sm" type="button" onclick="csLogout()">退出</button>
+      </div>
+    </div>
+    <div class="cs-wrap">
+      <div class="cs-list" id="cs-list"></div>
+      <div class="cs-main">
+        <div class="cs-chat-head" id="cs-chat-head"></div>
+        <div class="cs-thread" id="cs-thread"><div class="empty" style="margin:auto"><div class="empty-ic"><svg><use href="#i-msg"/></svg></div><div class="empty-t">选择左侧会话开始接待</div></div></div>
+        <div class="cs-composer">
+          <div class="cs-composer-acts" id="cs-composer-acts" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap"></div>
+          <button type="button" class="ghost sm" id="cs-quick-btn" onclick="csOpenQuickReplies()" title="快捷回复"><svg><use href="#i-bolt"/></svg></button>
+          <textarea id="cs-input" rows="1" placeholder="输入回复，Enter 发送 / Shift+Enter 换行"></textarea>
+          <button type="button" onclick="csSend()"><svg><use href="#i-send"/></svg>发送</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="cs-modal" class="cs-modal" hidden></div>
+  </section>
+
+  <section data-panel="cs-settings">
+  <div class="card cs-login-wrap" id="cs-lan-card" style="margin-top:16px">
+    <div class="card-head">
+      <span class="card-ic"><svg aria-hidden="true"><use href="#i-monitor"/></svg></span>
+      <h2>局域网客服服务器 <span class="sub">让局域网内其他电脑连到本机，共用同一个客服大厅</span></h2>
+    </div>
+    <div class="hint">启用后本程序额外监听局域网端口，其他电脑在客服登录卡的「客服服务器」填本机地址即可一起接待；客服回复经各自电脑的回投节点发出。本机以外的设备只能访问客服相关页面，管理接口仍只限本机。<b>勾选或改端口后需重启程序才生效。</b></div>
+    <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="cs-lan-enabled"> 启用局域网客服服务器</label>
+    <label style="max-width:220px">监听端口<input id="cs-lan-port" type="number" min="1" max="65535" placeholder="8080"></label>
+    <div class="hint" id="cs-lan-addr" style="margin-top:2px"></div>
+    <div class="form-actions">
+      <button type="button" onclick="csLanSave()">保存（重启后生效）</button>
+    </div>
+  </div>
+  <div class="card cs-login-wrap" id="cs-node-card" style="margin-top:16px">
+    <div class="card-head">
+      <span class="card-ic"><svg aria-hidden="true"><use href="#i-send"/></svg></span>
+      <h2>回投节点 <span class="sub">本机执行客服回复的平台自动发送（私信/评论）</span></h2>
+    </div>
+    <div class="hint">云客服服务器没有平台登录态。启用本节点后，坐席在客服接待里的回复会排队发回本机，由本机已登录的平台账号自动发出。需先在客服服务器「坐席管理」中配置一致的节点令牌。</div>
+    <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="cs-node-enabled"> 启用本机回投节点</label>
+    <label>客服服务器地址<input id="cs-node-url" placeholder="http://服务器IP:8080（与上方登录地址一致）"></label>
+    <label>节点令牌<input id="cs-node-token" type="password" placeholder="在服务器「坐席管理 → 回投节点令牌」中设置"></label>
+    <div class="form-actions">
+      <button type="button" onclick="csNodeSave(true)">保存并测试连接</button>
+      <span class="cs-login-err" id="cs-node-status"></span>
+    </div>
+  </div>
+  </section>
+
   <section data-panel="settings">
+  <div class="card" id="license-card">
+    <div class="card-head">
+      <span class="card-ic"><svg aria-hidden="true"><use href="#i-shield"/></svg></span>
+      <h2>授权信息 <span class="sub">到期前请联系服务人员续期</span></h2>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px 22px;padding:4px 2px">
+      <div><div class="field-help" style="margin-bottom:4px">授权状态</div><b id="lic-status">—</b></div>
+      <div><div class="field-help" style="margin-bottom:4px">客户名称</div><b id="lic-customer">—</b></div>
+      <div><div class="field-help" style="margin-bottom:4px">到期时间</div><b id="lic-expire">—</b></div>
+      <div><div class="field-help" style="margin-bottom:4px">剩余天数</div><b id="lic-days">—</b></div>
+      <div style="grid-column:1/-1">
+        <div class="field-help" style="margin-bottom:6px">机器指纹（续期或换机时发给服务人员）</div>
+        <div class="lic-fp-row"><code id="lic-fingerprint">—</code><button type="button" class="ghost" id="lic-copy-fp" style="padding:6px 12px">复制指纹</button></div>
+      </div>
+    </div>
+  </div>
   <div class="card appearance-card">
     <div class="card-head">
       <span class="card-ic"><svg aria-hidden="true"><use href="#i-sun"/></svg></span>
@@ -2502,6 +2785,28 @@
         <p class="field-help">简化切换与加载动画；系统的减少动态效果设置始终生效。</p>
       </div>
     </div>
+    <fieldset class="appearance-fieldset">
+      <legend>品牌自定义</legend>
+      <div class="appearance-options" style="grid-template-columns:1fr 1fr;gap:12px;align-items:end">
+        <label class="appearance-choice" style="flex-direction:column;align-items:stretch;gap:6px">
+          <span><b>产品名称</b></span>
+          <input type="text" id="branding-name" placeholder="留空使用默认 mmm" style="padding:8px 10px;border:1px solid var(--line, #d6d6dc);border-radius:8px;background:var(--surface,#fff);color:var(--fg,#333)">
+          <small>显示在窗口标题与顶部品牌区</small>
+        </label>
+        <label class="appearance-choice" style="flex-direction:column;align-items:stretch;gap:6px">
+          <span><b>Logo 图片</b></span>
+          <input type="file" id="branding-logo" accept="image/png,image/jpeg,image/svg+xml,image/x-icon,image/webp,image/gif" style="padding:6px">
+          <small>支持 PNG / JPG / SVG，建议方形透明图，≤5MB</small>
+        </label>
+      </div>
+      <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
+        <button type="button" class="primary" id="branding-save">保存品牌</button>
+        <button type="button" class="ghost" id="branding-clear-logo">清除 Logo</button>
+        <button type="button" class="ghost" id="branding-reset">恢复默认</button>
+        <span id="branding-status" role="status" aria-live="polite" style="align-self:center;color:var(--muted,#616169);font-size:13px"></span>
+      </div>
+      <p class="field-help">品牌文件保存在 <code>data/branding/</code>，同时影响桌面端窗口图标与标题。</p>
+    </fieldset>
     <div class="appearance-status"><svg aria-hidden="true"><use href="#i-check"/></svg><span id="appearance-status" role="status" aria-live="polite">偏好自动保存在此浏览器</span></div>
   </div>
   <!-- 下载设置 -->
@@ -2813,7 +3118,7 @@
         <div class="form-field sh-only">
           <label for="pub-location">位置（可选）</label><input id="pub-location" placeholder="城市或地点名，例如：东莞市 / 杭州西湖">
         </div>
-        <fieldset class="publish-permissions dy-only" id="pub-dy-opts">
+        <fieldset class="publish-permissions pubvis-only" id="pub-dy-opts">
           <legend>互动与权限</legend>
           <div class="publish-permission">
             <label class="field" for="pub-visibility">谁可以看</label>
@@ -2823,7 +3128,7 @@
               <option value="private">仅自己可见</option>
             </select>
           </div>
-          <div class="publish-permission">
+          <div class="publish-permission dy-only">
             <label class="field" for="pub-allowsave">保存权限</label>
             <select id="pub-allowsave" aria-label="保存权限">
               <option value="1">允许他人保存</option>
@@ -2940,7 +3245,7 @@
         <button class="sm" onclick="approveAllDrafts()"><svg><use href="#i-check"/></svg>全部通过</button>
       </div>
       <div class="table-wrap"><table aria-label="自动评论任务记录"><thead><tr>
-        <th>文案</th><th>目标作品</th><th>对象</th><th>计划时间</th><th>通道</th><th>状态</th><th>操作</th>
+        <th>目标评论</th><th>文案</th><th>目标作品</th><th>对象</th><th>计划时间</th><th>通道</th><th>状态</th><th>操作</th>
       </tr></thead><tbody id="ac-task-table"></tbody></table></div>
     </div>
   </section>
@@ -3122,7 +3427,8 @@
           <div class="form-field dy-only"><label for="w-mode">评论来源</label><select id="w-mode" onchange="populateWatchAccount()">
               <option value="public">公开评论区</option><option value="creator">创作中心（仅自有账号）</option>
           </select></div>
-          <div class="form-field"><label for="w-acc">使用账号</label><select id="w-acc"></select></div>
+          <div class="form-field"><label for="w-acc">使用账号</label><select id="w-acc"></select>
+              <p class="field-help">建议绑定已登录账号；不绑定则匿名抓取，易被平台登录墙拦截导致取不到数据。</p></div>
           <div class="form-field"><label for="w-interval">检查频率</label><select id="w-interval" aria-describedby="w-interval-help">
               <option value="1">每 1 秒</option><option value="5">每 5 秒</option><option value="10">每 10 秒</option>
               <option value="15">每 15 秒</option><option value="30">每 30 秒</option><option value="60">每 1 分钟</option>
@@ -3221,8 +3527,8 @@
         </select>
         <input id="comment-min-likes" type="number" min="0" step="1" placeholder="最低点赞" aria-label="评论最低点赞数" onchange="refreshComments(true)">
         <select id="comment-sort" onchange="refreshComments(true)" aria-label="评论排序">
-          <option value="captured_desc">最近抓取</option><option value="captured_asc">最早抓取</option>
-          <option value="latest">最新评论</option><option value="oldest">最早评论</option><option value="likes_desc">点赞最多</option>
+          <option value="latest">最新评论</option><option value="captured_desc">最近抓取</option><option value="captured_asc">最早抓取</option>
+          <option value="oldest">最早评论</option><option value="likes_desc">点赞最多</option>
         </select>
         <span class="filter-count" id="comment-filter-count" role="status" aria-live="polite"></span>
         <div class="toolbar-actions"><span class="toolbar-actions-label">操作</span>
@@ -3437,10 +3743,10 @@
         </div>
       </div>
       <div class="tabbar" style="position:static;margin-bottom:14px">
-        <button class="tab active" data-hubtab="myworks" onclick="switchHubTab('myworks')"><svg><use href="#i-film"/></svg>我的作品 <span class="tab-badge" id="hb-myworks">0</span></button>
-        <button class="tab notsh-only" data-hubtab="following" onclick="switchHubTab('following')"><svg><use href="#i-user"/></svg>关注 <span class="tab-badge" id="hb-following">0</span></button>
-        <button class="tab notsh-only" data-hubtab="fans" onclick="switchHubTab('fans')"><svg><use href="#i-heart"/></svg>粉丝 <span class="tab-badge" id="hb-fans">0</span></button>
-        <button class="tab notsh-only" data-hubtab="dm" onclick="switchHubTab('dm')"><svg><use href="#i-send"/></svg>私信 <span class="tab-badge" id="hb-dm">0</span></button>
+        <button class="tab active" data-hubtab="myworks" data-cap="own_works" onclick="switchHubTab('myworks')"><svg><use href="#i-film"/></svg>我的作品 <span class="tab-badge" id="hb-myworks">0</span></button>
+        <button class="tab notsh-only" data-hubtab="following" data-cap="follow_sync" onclick="switchHubTab('following')"><svg><use href="#i-user"/></svg>关注 <span class="tab-badge" id="hb-following">0</span></button>
+        <button class="tab notsh-only" data-hubtab="fans" data-cap="follow_sync" onclick="switchHubTab('fans')"><svg><use href="#i-heart"/></svg>粉丝 <span class="tab-badge" id="hb-fans">0</span></button>
+        <button class="tab notsh-only" data-hubtab="dm" data-cap="dm" onclick="switchHubTab('dm')"><svg><use href="#i-send"/></svg>私信 <span class="tab-badge" id="hb-dm">0</span></button>
         <button class="tab" data-hubtab="stats" onclick="switchHubTab('stats')"><svg><use href="#i-eye"/></svg>数据 <span class="tab-badge" id="hb-stats">0</span></button>
       </div>
 
@@ -3517,6 +3823,10 @@
         <div class="dm-wrap">
           <div class="dm-list" id="dm-convs"></div>
           <div class="dm-main">
+            <div id="dm-cs-bar" style="display:none;padding:6px 10px;border-bottom:1px solid #e8e8ee;background:#fafafc">
+              <button class="ghost sm" type="button" onclick="csTakeoverDm()"><svg><use href="#i-msg"/></svg>转人工客服接待</button>
+              <span class="mut" style="font-size:12px;margin-left:8px">转入后，客服在「客服接待」中回复，并自动回投本私信</span>
+            </div>
             <div class="dm-thread" id="dm-thread"><div class="empty"><div class="empty-ic"><svg><use href="#i-send"/></svg></div><div class="empty-t">选择左侧会话查看消息</div></div></div>
             <div class="dm-composer">
               <input id="dm-input" placeholder="输入私信内容…" aria-label="私信内容" onkeydown="if(event.key==='Enter')sendDm()">
@@ -3671,5 +3981,81 @@
 <script src="/static/app.js"></script>
 <script src="/static/workspace-ui.js"></script>
 <script src="/static/workbench.js"></script>
+<script>
+// 品牌自定义：保存 / 清除 Logo / 恢复默认
+(function () {
+  var nameInput = document.getElementById('branding-name');
+  var logoInput = document.getElementById('branding-logo');
+  var status = document.getElementById('branding-status');
+  var saveBtn = document.getElementById('branding-save');
+  var clearBtn = document.getElementById('branding-clear-logo');
+  var resetBtn = document.getElementById('branding-reset');
+  if (!saveBtn) return;
+
+  function setStatus(msg, ok) {
+    status.textContent = msg || '';
+    status.style.color = ok ? 'var(--success,#07733f)' : 'var(--muted,#616169)';
+  }
+
+  // 回填当前名称
+  fetch('/api/branding').then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (b) { if (b && b.name) nameInput.value = b.name; })
+    .catch(function () {});
+
+  async function postBranding(form) {
+    var res = await fetch('/api/branding', { method: 'POST', body: form });
+    if (!res.ok) {
+      var err = await res.text();
+      throw new Error(err || ('HTTP ' + res.status));
+    }
+    return res.json();
+  }
+
+  saveBtn.addEventListener('click', async function () {
+    setStatus('保存中…');
+    try {
+      var form = new FormData();
+      form.append('name', nameInput.value || '');
+      if (logoInput.files && logoInput.files[0]) form.append('logo', logoInput.files[0]);
+      var b = await postBranding(form);
+      window.__applyBranding(b);
+      setStatus('品牌已保存，刷新后完全生效', true);
+    } catch (e) {
+      setStatus('保存失败：' + (e.message || e));
+    }
+  });
+
+  clearBtn.addEventListener('click', async function () {
+    setStatus('清除中…');
+    try {
+      var form = new FormData();
+      form.append('clear', 'true');
+      form.append('name', nameInput.value || '');
+      var b = await postBranding(form);
+      window.__applyBranding(b);
+      logoInput.value = '';
+      setStatus('Logo 已清除', true);
+    } catch (e) {
+      setStatus('清除失败：' + (e.message || e));
+    }
+  });
+
+  resetBtn.addEventListener('click', async function () {
+    if (!confirm('确定恢复默认品牌？将清除自定义名称与 Logo。')) return;
+    setStatus('恢复中…');
+    try {
+      var form = new FormData();
+      form.append('clear', 'true');
+      form.append('name', '');
+      await postBranding(form);
+      nameInput.value = '';
+      logoInput.value = '';
+      setStatus('已恢复默认，刷新页面生效', true);
+    } catch (e) {
+      setStatus('恢复失败：' + (e.message || e));
+    }
+  });
+})();
+</script>
 </body>
 </html>

@@ -27,6 +27,19 @@ def local_request(request: Request) -> bool:
                 and loopback(request.url.hostname or ""))
 
 
+# 客服子系统允许公网访问的路径（访客链接 + 坐席接口 + 回投节点接口）。
+# - /chat/{token}：访客移动页；/api/cs/guest/* 凭会话 token 自鉴权
+# - /api/cs/agent/* 凭坐席 Bearer token 自鉴权（登录接口带失败限流）
+# - /api/cs/node/* 凭回投节点令牌（X-CS-Node-Token）自鉴权：
+#   局域网/云端工作台节点从别的机器来，回环检查必须放行，否则一律 403
+# 其余 /api 仍严格限定本机回环。
+def cs_public_path(path: str) -> bool:
+    return (path.startswith("/chat/")
+            or path.startswith("/api/cs/guest/")
+            or path.startswith("/api/cs/agent/")
+            or path.startswith("/api/cs/node/"))
+
+
 def _same_origin(request: Request, value: str) -> bool:
     try:
         origin, target = urlsplit(value), urlsplit(str(request.url))
@@ -53,6 +66,7 @@ class LocalAccessMiddleware:
         request = Request(scope, receive=receive)
         path = scope.get("path", "")
         api = path == "/api" or path.startswith("/api/")
+        public_cs = cs_public_path(path)
         error = None
         try:
             valid_local = local_request(request) and len(request.headers.getlist("host")) == 1
@@ -60,10 +74,14 @@ class LocalAccessMiddleware:
         except ValueError:
             valid_local = False
         if not valid_local:
-            error = "当前工作台仅供本机使用，请通过 127.0.0.1 或 localhost 访问"
-        elif api and (request.headers.get("sec-fetch-site", "") in {"cross-site", "same-site"}
-                      or ("origin" in request.headers and not _same_origin(request, request.headers["origin"]))):
-            error = "请从 CreatorHub 同源页面发起请求"
+            if not public_cs:
+                error = "当前工作台仅供本机使用，请通过 127.0.0.1 或 localhost 访问"
+            # 客服公网路径：鉴权由 api 层的会话/坐席令牌完成，不做回环与同源限制
+        elif api and not public_cs and (
+                request.headers.get("sec-fetch-site", "") in {"cross-site", "same-site"}
+                or ("origin" in request.headers
+                    and not _same_origin(request, request.headers["origin"]))):
+            error = "请从 mmm 同源页面发起请求"
         if error:
             await JSONResponse({"detail": error}, status_code=403,
                                headers={"Cache-Control": "no-store"})(scope, receive, send)

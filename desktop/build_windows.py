@@ -25,11 +25,11 @@ def main():
     staging = ROOT / "build" / "windows"
     staging.mkdir(parents=True, exist_ok=True)
     dist_root = (ROOT / args.dist_dir).resolve()
-    output = (dist_root / "CreatorHub").resolve()
+    output = (dist_root / "mmm").resolve()
     if not output.is_relative_to(ROOT.resolve()):
         raise SystemExit("Build output must remain inside the repository")
     from desktop.ui import brand_image
-    brand_image(256).save(staging / "CreatorHub.ico", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (256, 256)])
+    brand_image(256).save(staging / "mmm.ico", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (256, 256)])
     build_guide(staging / "desktop-guide")
     (staging / "desktop-version.txt").write_text(args.version, encoding="utf-8")
     (staging / "build-runtime.json").write_text(json.dumps({
@@ -39,14 +39,14 @@ def main():
     # Independent updater survives replacement of the main onedir bundle.
     helper_dir = staging / "updater"
     subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--onefile", "--windowed",
-                    "--name", "CreatorHubUpdater", "--paths", str(ROOT), "--distpath", str(helper_dir),
+                    "--name", "mmmUpdater", "--paths", str(ROOT), "--distpath", str(helper_dir),
                     "--workpath", str(staging / "updater-work"), "--specpath", str(staging),
                     str(ROOT / "desktop" / "update_helper.py")], cwd=ROOT, check=True)
-    helper = helper_dir / "CreatorHubUpdater.exe"
+    helper = helper_dir / "mmmUpdater.exe"
     subprocess.run([str(helper), "--self-test"], check=True, timeout=30,
                    creationflags=subprocess.CREATE_NO_WINDOW)
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--onedir", "--windowed",
-               "--name", "CreatorHub", "--icon", str(staging / "CreatorHub.ico"),
+               "--name", "mmm", "--icon", str(staging / "mmm.ico"),
                "--distpath", str(dist_root),
                "--workpath", str(staging / "work"), "--specpath", str(staging),
                "--paths", str(ROOT), "--hidden-import", "pystray._win32",
@@ -55,7 +55,10 @@ def main():
         command += ["--collect-all", package]
     if not (ROOT / "desktop" / "web" / "index.html").exists():
         raise SystemExit("Build the desktop renderer first: npm run build:desktop")
+    if not (ROOT / "app" / "license_pubkey.pem").is_file():
+        raise SystemExit("缺少 app/license_pubkey.pem：请先运行 python -m tools.generate_license init-keys")
     for source, destination in ((ROOT / "config.example.yaml", "."),
+                                (ROOT / "app" / "license_pubkey.pem", "."),
                                 (helper, "desktop"),
                                 (ROOT / "desktop" / "languages" / "ChineseSimplified-LICENSE.txt", "desktop/licenses"),
                                 (ROOT / "desktop" / "web", "desktop/web"),
@@ -65,7 +68,7 @@ def main():
         command += ["--add-data", f"{source};{destination}"]
     command.append(str(ROOT / "desktop" / "launcher.py"))
     subprocess.run(command, cwd=ROOT, check=True)
-    print("Built:", output / "CreatorHub.exe")
+    print("Built:", output / "mmm.exe")
 
 
 if __name__ == "__main__":

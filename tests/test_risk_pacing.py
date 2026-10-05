@@ -137,6 +137,45 @@ def test_rate_limit_without_challenge_keeps_gradual_recovery(paced):
     assert paced.risk.preflight(paced.account_id, OperationKind.COMMENT, now=now + timedelta(hours=1)).signal == "probe_only"
 
 
+def test_manual_write_bypasses_soft_pacing_but_not_hard_holds(paced):
+    policy = paced.cfg.risk_control
+    policy.comment_min_gap_seconds = 600
+    policy.comment_hourly_cap = 1
+    policy.operation_gap_min_seconds = policy.operation_gap_max_seconds = 100
+    policy.session_operation_limit = 1
+    policy.session_rest_min_seconds = policy.session_rest_max_seconds = 300
+    now = datetime(2026, 9, 7, 12)
+    paced.risk.record_success(paced.account_id, OperationKind.COMMENT, now=now)
+    soon = now + timedelta(seconds=10)
+    # 自动通道:最小间隔把紧跟的评论挡下
+    blocked = paced.risk.preflight(
+        paced.account_id, OperationKind.COMMENT, now=soon)
+    assert not blocked.allowed and blocked.signal == "kind_gap"
+    # 人工「立即发送」:软节流(间隔/配额/抖动/会话休息)全部放行
+    assert paced.risk.preflight(
+        paced.account_id, OperationKind.COMMENT, now=soon,
+        manual_write=True).allowed
+    # 硬风控:冷却期人工也不可越过
+    with db.get_session() as s:
+        state = s.get(AccountRiskState, paced.account_id)
+        state.cooldown_until = now + timedelta(hours=1)
+        s.add(state)
+        s.commit()
+    decision = paced.risk.preflight(
+        paced.account_id, OperationKind.COMMENT, now=soon, manual_write=True)
+    assert not decision.allowed and decision.signal == "cooldown"
+    with db.get_session() as s:
+        state = s.get(AccountRiskState, paced.account_id)
+        state.cooldown_until = None
+        # 人工验证(短信/滑块):界面「立即发」可覆盖(单任务触发不应永久阻塞整号)
+        state.manual_review_required = True
+        s.add(state)
+        s.commit()
+    decision = paced.risk.preflight(
+        paced.account_id, OperationKind.COMMENT, now=soon, manual_write=True)
+    assert decision.allowed
+
+
 def test_network_backoff_is_persisted_and_late_success_does_not_erase_it(paced):
     now = datetime(2026, 9, 7, 2)
     paced.risk.record_failure(paced.account_id, OperationKind.READ_HEAVY, TimeoutError(), now=now)

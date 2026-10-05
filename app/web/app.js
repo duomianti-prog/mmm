@@ -84,11 +84,18 @@ const api = async (path, opts) => {
       throw new Error("当前离线，内容已保留；连接恢复后请手动提交");
     }
     // Bound read-only refreshes; never abort a write and imply it was not sent.
-    if ((!opts.method || opts.method.toUpperCase() === "GET") && !opts.signal) {
+    // GET 默认 60s 边界;写操作默认不中断,但耗时的读类 POST(如「立即抓取」)
+    // 可由调用方显式给 opts.timeoutMs 做兜底,避免浏览器异常时无限转圈。
+    const isGet = !opts.method || opts.method.toUpperCase() === "GET";
+    const timeoutMs = Number(opts.timeoutMs) > 0
+      ? Number(opts.timeoutMs)
+      : (isGet ? 60000 : 0);
+    if (timeoutMs > 0 && !opts.signal) {
       const controller = new AbortController();
       opts.signal = controller.signal;
-      timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 60000);
+      timeout = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
     }
+    delete opts.timeoutMs;
     const headers = new Headers(opts.headers || {});
     try {
       const adminToken = sessionStorage.getItem("creatorhub-risk-admin-token") || "";
@@ -113,7 +120,7 @@ const api = async (path, opts) => {
   } catch (e) {
     _apiFailures++;
     globalThis.CreatorHubWorkbench?.requestResult?.({ path, request: workbenchRequest, ok: false, method: (opts?.method || "GET").toUpperCase() });
-    if (timedOut) throw new Error("读取超时，请稍后重试");
+    if (timedOut) throw new Error("请求超时，请稍后重试");
     throw e;
   } finally { clearTimeout(timeout); _apiActive--; _barSync(); }
 };
@@ -1040,7 +1047,62 @@ async function exportModuleReport(module, full = false, explicitBtn = null) {
 }
 
 let PLATFORM = "douyin";
-const PF_NAME = { douyin: "抖音", xhs: "小红书", kuaishou: "快手", shipinhao: "视频号" };
+const PF_NAME = { douyin: "抖音", xhs: "小红书", kuaishou: "快手", shipinhao: "视频号", tiktok: "TikTok" };
+// ── 平台目录:由后端 /api/platforms 驱动(显示名/能力标志/启用状态)。
+// 后端不可达时回退为内置清单,能力面与旧版本完全一致。
+const PF_FALLBACK_CATALOG = {
+  douyin: { label: "抖音", enabled: true, capabilities: ["link_download", "own_works", "follow_sync", "work_monitor", "comment_monitor", "danmaku_monitor", "keyword_collection", "publish", "auto_comment", "dm", "social_action", "cookie_login", "creator_login"] },
+  xhs: { label: "小红书", enabled: true, capabilities: ["link_download", "own_works", "follow_sync", "work_monitor", "comment_monitor", "keyword_collection", "publish", "auto_comment", "dm", "social_action", "cookie_login", "creator_login"] },
+  kuaishou: { label: "快手", enabled: true, capabilities: ["link_download", "own_works", "follow_sync", "work_monitor", "comment_monitor", "publish", "auto_comment", "social_action", "cookie_login", "creator_login"] },
+  shipinhao: { label: "视频号", enabled: true, capabilities: ["own_works", "publish", "creator_login"] },
+  tiktok: { label: "TikTok", enabled: true, capabilities: ["cookie_login", "link_download", "own_works", "follow_sync", "work_monitor", "comment_monitor", "keyword_collection", "publish", "auto_comment", "dm", "social_action"] },
+};
+let PF_CATALOG_ROWS = null;
+function pfRows() { return PF_CATALOG_ROWS || PF_FALLBACK_CATALOG; }
+function pfInfo(pf) { return pfRows()[pf] || null; }
+function pfLabel(pf) { return (pfInfo(pf) && pfInfo(pf).label) || PF_NAME[pf] || pf; }
+function pfCan(pf, cap) {
+  const r = pfInfo(pf);
+  return !!(r && r.enabled !== false && (r.capabilities || []).includes(cap));
+}
+function pfKeys() {
+  return Object.keys(pfRows()).filter(k => pfRows()[k].enabled !== false);
+}
+async function loadPlatformCatalog() {
+  try {
+    const rows = await api("/api/platforms");
+    const map = {};
+    (rows || []).forEach(r => {
+      map[r.key] = { label: r.label, enabled: r.enabled !== false, color: r.color || "", capabilities: r.capabilities || [] };
+    });
+    PF_CATALOG_ROWS = map;
+    syncPlatformTabs();
+    if (!pfKeys().includes(PLATFORM)) switchPlatform(pfKeys()[0] || "douyin");
+    else applyPlatformUI();
+  } catch (e) { /* 离线回退:沿用内置清单 */ }
+}
+function syncPlatformTabs() {
+  const host = document.querySelector(".pswitch");
+  if (!host) return;
+  pfKeys().forEach(key => {
+    let btn = host.querySelector('button[data-pf="' + key + '"]');
+    if (!btn) {
+      btn = document.createElement("button");
+      btn.type = "button";
+      btn.setAttribute("role", "tab");
+      btn.dataset.pf = key;
+      btn.textContent = pfLabel(key);
+      btn.onclick = () => switchPlatform(key);
+      const info = pfInfo(key);
+      if (info && info.color) btn.style.setProperty("--pf-accent", info.color);
+      host.appendChild(btn);
+    }
+  });
+  host.querySelectorAll("button[data-pf]").forEach(b => {
+    const info = pfInfo(b.dataset.pf);
+    b.classList.toggle("hidden", !(info && info.enabled !== false));
+  });
+}
 let CURRENT_TAB = "overview";
 const PAGE_META = {
   overview: {
@@ -1082,6 +1144,12 @@ const PAGE_META = {
   notifications: {
     title: "通知渠道", desc: "配置 Bark、钉钉或 Telegram，及时接收任务提醒。"
   },
+  cs: {
+    title: "客服接待", desc: "接待访客链接与平台私信/评论转人工，可转接、邀请同事协作。"
+  },
+  "cs-settings": {
+    title: "客服设置", desc: "配置本机回投节点，使客服回复能自动发送到平台私信/评论。"
+  },
   settings: {
     title: "设置", desc: "管理外观、下载、AI 文案与采集运行配置。"
   },
@@ -1090,17 +1158,17 @@ function updatePageContext(name = CURRENT_TAB) {
   const meta = PAGE_META[name] || PAGE_META.overview;
   if ($("page-title")) $("page-title").textContent = meta.title;
   if ($("page-desc")) $("page-desc").textContent = meta.desc;
-  if ($("page-platform")) $("page-platform").textContent = PF_NAME[PLATFORM] || "当前平台";
+  if ($("page-platform")) $("page-platform").textContent = pfLabel(PLATFORM) || "当前平台";
   if ($("page-kicker")) $("page-kicker").textContent = pfIsChannels(PLATFORM) ? "本账号工作台" : "多平台工作台";
-  document.title = `${meta.title} · ${PF_NAME[PLATFORM] || ""} | CreatorHub`;
+  document.title = `${meta.title} · ${pfLabel(PLATFORM) || ""} | mmm`;
   globalThis.CreatorHubWorkbench?.navigate?.();
 }
-// 是否支持「发布」面板(四平台均有)
-function pfHasPublish(pf) { return pf === "xhs" || pf === "kuaishou" || pf === "douyin" || pf === "shipinhao"; }
+// 是否支持「发布」面板:由后端平台能力清单决定
+function pfHasPublish(pf) { return pfCan(pf, "publish"); }
 // 视频号只有「本账号」数据(助手接口本账号),不支持监控他人作品/评论
 function pfIsChannels(pf) { return pf === "shipinhao"; }
 function switchPlatform(pf) {
-  if (!["douyin", "xhs", "kuaishou", "shipinhao"].includes(pf)) pf = "douyin";
+  if (!pfKeys().includes(pf)) pf = "douyin";
   globalThis.CreatorHubWorkbench?.platformChanging?.(pf);
   PLATFORM = pf;
   VIEW_REQUESTS.clear();
@@ -1142,6 +1210,7 @@ function applyPlatformUI() {
   document.body.classList.toggle("pf-xhs", PLATFORM === "xhs");
   document.body.classList.toggle("pf-kuaishou", PLATFORM === "kuaishou");
   document.body.classList.toggle("pf-shipinhao", PLATFORM === "shipinhao");
+  document.body.dataset.pf = PLATFORM;
   // 视频号:只有本账号数据,隐藏「监控他人作品/评论」相关入口(.notsh-only)
   document.body.classList.toggle("pf-channels", pfIsChannels(PLATFORM));
   if (PLATFORM !== "douyin" && CURRENT_TAB === "danmaku") switchTab("overview");
@@ -1152,30 +1221,45 @@ function applyPlatformUI() {
     b.tabIndex = active ? 0 : -1;
   });
   document.querySelectorAll(".dy-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "douyin"));
+  // 可见范围权限:抖音与 TikTok 网页发布都支持
+  document.querySelectorAll(".pubvis-only").forEach(e => e.classList.toggle("hidden", !["douyin", "tiktok"].includes(PLATFORM)));
   document.querySelectorAll(".xhs-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "xhs"));
   document.querySelectorAll(".ks-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "kuaishou"));
   document.querySelectorAll(".sh-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "shipinhao"));
+  document.querySelectorAll(".tt-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "tiktok"));
   document.querySelectorAll(".notsh-only").forEach(e => e.classList.toggle("hidden", pfIsChannels(PLATFORM)));
-  document.querySelectorAll(".collect-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "douyin"));
+  document.querySelectorAll(".collect-only").forEach(e => e.classList.toggle("hidden", !pfCan(PLATFORM, "keyword_collection")));
+  // 通用能力门:导航/区块可声明 data-cap,当前平台缺能力则隐藏
+  document.querySelectorAll("[data-cap]").forEach(e => {
+    e.classList.toggle("hidden", !pfCan(PLATFORM, e.dataset.cap));
+  });
+  // 切到的平台不支持当前页时,回到工作概览
+  const activeNav = document.querySelector(`.navitem[data-tab="${CURRENT_TAB}"]`);
+  if (activeNav && activeNav.classList.contains("hidden")) switchTab("overview");
   document.querySelectorAll(".meta-scope").forEach(e => {
-    e.textContent = (PF_NAME[PLATFORM] || "当前平台") + "内独立";
+    e.textContent = (pfLabel(PLATFORM) || "当前平台") + "内独立";
   });
   // 发布面板入口:抖音 / 小红书 / 快手均显示
   document.querySelectorAll(".pub-only").forEach(e => e.classList.toggle("hidden", !pfHasPublish(PLATFORM)));
   // 发布面板文案随平台切换
-  const ks = PLATFORM === "kuaishou", dy = PLATFORM === "douyin", sph = PLATFORM === "shipinhao";
+  const ks = PLATFORM === "kuaishou", dy = PLATFORM === "douyin",
+    sph = PLATFORM === "shipinhao", tt = PLATFORM === "tiktok";
   const pubSub = $("pub-head-sub");
   if (pubSub) pubSub.textContent = dy ? "上传图集 / 视频到抖音创作平台(实验性)"
     : ks ? "上传图集 / 视频到快手创作平台(实验性)"
-    : sph ? "上传视频到视频号助手(实验性)" : "上传图集 / 视频到小红书(实验性)";
-  if ($("pub-head-lead")) $("pub-head-lead").textContent = (ks || dy || sph) ? "发布作品" : "发布笔记";
-  if ($("pub-title")) $("pub-title").placeholder = (ks || dy || sph) ? "给作品起个标题" : "给笔记起个标题";
+    : sph ? "上传视频到视频号助手(实验性)"
+    : tt ? "上传图集 / 视频到 TikTok 创作者中心(实验性)"
+    : "上传图集 / 视频到小红书(实验性)";
+  if ($("pub-head-lead")) $("pub-head-lead").textContent = (ks || dy || sph || tt) ? "发布作品" : "发布笔记";
+  if ($("pub-title")) $("pub-title").placeholder = (ks || dy || sph || tt) ? "给作品起个标题" : "给笔记起个标题";
   const pubHintText = dy
     ? "发布通过自动化抖音创作平台完成。首次登录或触发验证时，请在弹出窗口中完成短信验证或扫码；视频上传后还需等待转码。注意：定时发布可能因本人验证而暂停，建议发布时在场。"
     : ks
     ? "发布通过自动化快手创作平台完成。若遇验证码或需要补充封面，请在弹出窗口中手动处理；定时任务由后台引擎按计划执行。"
     : sph
     ? "发布通过自动化视频号助手完成。视频需等待转码，发布前可能要求补充封面、实名或人脸验证，请在弹出窗口中处理。注意：平台页面改版后可能需要重新适配。"
+    : tt
+    ? "发布通过自动化 TikTok 创作者中心(英文页)完成。标题/正文/话题会合并为一条 caption；视频上传后需等待处理，遇到滑块验证请在弹出窗口完成。提交只点击一次；若显示“结果待确认”，请到 TikTok 作品管理核对，系统不会自动重发。预约由后台队列执行，不使用网页定时。"
     : "发布通过账号独立的可见 Chrome 页面完成。提交只点击一次；若显示“结果待确认”，请先到小红书核对，系统不会自动重发。";
   const pubHint = $("pub-hint");
   if (pubHint) {
@@ -1196,10 +1280,12 @@ function applyPlatformUI() {
   if (wl) wl.textContent = PLATFORM === "xhs"
     ? "笔记 / 创作者主页 / 完整分享文案 / ID"
     : PLATFORM === "kuaishou" ? "作品 / 创作者主页 / 完整分享文案 / ID"
+    : PLATFORM === "tiktok" ? "视频链接 / 创作者主页 / @TikTok 号 / 数字 ID"
     : "视频 / 账号主页 / 完整分享文案 / ID";
   if ($("w-url")) $("w-url").placeholder = PLATFORM === "xhs"
     ? "直接粘贴整段小红书分享文案，将自动提取笔记或主页链接"
     : PLATFORM === "kuaishou" ? "直接粘贴整段快手分享文案，将自动提取作品或主页链接"
+    : PLATFORM === "tiktok" ? "粘贴 TikTok 视频链接、创作者主页链接或 @TikTok 号"
     : "直接粘贴整段抖音分享文案，将自动提取视频或主页链接";
   resetWatchTargetState();
   const ckl = $("ck-label");
@@ -1218,10 +1304,16 @@ function applyPlatformUI() {
   if (pfIsChannels(PLATFORM)) {
     const cur = (document.querySelector('.navitem.active') || {}).dataset;
     if (cur && ["monitors", "comments", "autocomment"].includes(cur.tab)) switchTab("hub");
-    // 视频号本账号只有「我的作品 / 数据」;若停在关注/粉丝/私信子页,切回我的作品
-    if (["following", "fans", "dm"].includes(HUB_TAB)) switchHubTab("myworks");
   }
-  if (PLATFORM !== "douyin" && CURRENT_TAB === "collections") switchTab("overview");
+  // 「我的内容」子页按能力门:关注/粉丝需 follow_sync,私信需 dm;
+  // 视频号助手无对外关注/粉丝接口,私信仅收件箱且 v1.7.0 不实现,故隐藏。
+  // TikTok 暂无私信。
+  if (["following", "fans"].includes(HUB_TAB) && !pfCan(PLATFORM, "follow_sync")) {
+    switchHubTab("myworks");
+  } else if (HUB_TAB === "dm" && !pfCan(PLATFORM, "dm")) {
+    switchHubTab("myworks");
+  }
+  if (!pfCan(PLATFORM, "keyword_collection") && CURRENT_TAB === "collections") switchTab("overview");
   // 不支持发布的平台:若正停在该面板则回到总览(当前四平台均支持,兜底保留)
   if (!pfHasPublish(PLATFORM)) {
     const pub = document.querySelector('[data-panel="publish"]');
@@ -1389,15 +1481,20 @@ function applyMonitorForm() {
   const title = $("mon-add-title");
   const lbl = $("t-url-label");
   const parseButton = document.querySelector('[data-panel="monitors"] .smart-target-action');
-  if (PLATFORM === "douyin" || PLATFORM === "kuaishou") {
+  if (PLATFORM === "douyin" || PLATFORM === "kuaishou" || PLATFORM === "tiktok") {
     const isKs = PLATFORM === "kuaishou";
-    if (title) title.innerHTML = (isKs ? '添加创作者监控' : '添加作品监控')
+    const isTt = PLATFORM === "tiktok";
+    const titleText = isKs ? "添加创作者监控"
+      : isTt ? "添加创作者监控" : "添加作品监控";
+    if (title) title.innerHTML = titleText
       + ' <span class="sub">监控并下载新作品</span>';
     if (lbl) lbl.textContent = isKs
       ? "创作者主页 / 完整分享文案 / user_id"
+      : isTt ? "创作者主页链接(https://www.tiktok.com/@用户名) / TikTok 号"
       : "创作者主页 / 完整分享文案 / sec_uid";
     $("t-url").placeholder = isKs
       ? "直接粘贴整段快手主页分享文案，将自动提取有效链接"
+      : isTt ? "粘贴 TikTok 创作者主页链接或 @TikTok 号，须选择已过网络体检的账号"
       : "直接粘贴整段抖音主页分享文案，将自动提取有效链接";
     if (parseButton) parseButton.classList.remove("hidden");
     resetMonitorTargetState();
@@ -1421,6 +1518,11 @@ function applyMonitorForm() {
 // ─── 标签页切换 ───
 function switchTab(name, pushHistory = false) {
   if (!PAGE_META[name]) name = "overview";
+  // 能力门:目标 tab 的导航入口在当前平台被隐藏时(如视频号的对外监控/
+  // 关键词采集/自动评论),hash 直达或编程调用也一律回到工作概览,
+  // 杜绝面板可见但提交必然失败的空转(后端另有同步 400 闸门)。
+  const targetNav = document.querySelector(`.navitem[data-tab="${name}"]`);
+  if (targetNav && targetNav.classList.contains("hidden")) name = "overview";
   globalThis.CreatorHubWorkbench?.beforeNavigate?.();
   const changed = CURRENT_TAB !== name;
   CURRENT_TAB = name;
@@ -1651,7 +1753,7 @@ function pollLogin(tid) {
         clearTimeout(qrTimer);
         if (res.profile_status === "invalid") {
           $("qrstatus").textContent = "登录校验未通过，请重新扫码";
-          toast((PF_NAME[PLATFORM] || "账号") + "登录校验未通过，请重新扫码", "err");
+          toast((pfLabel(PLATFORM) || "账号") + "登录校验未通过，请重新扫码", "err");
         } else {
           const suffix = ["error", "deferred"].includes(res.profile_status) ? "（资料可稍后刷新）" : "";
           $("qrstatus").textContent = "登录成功 ✓ " + (res.nickname || "") + suffix;
@@ -1789,6 +1891,24 @@ async function startChannelsLogin() {
     $("qrstatus").innerHTML = `${ic("i-eye")} <b>视频号助手窗口已打开</b>，请使用微信扫码登录，读取和发布共用此登录态。<br>登录成功后请稍等片刻再关闭窗口。`;
     pollLogin(res.task_id);
   } catch (e) { $("qrstatus").textContent = "启动失败: " + e.message; toast("视频号登录启动失败:" + e.message, "err"); }
+}
+
+// ─── TikTok 国际版网页登录(需海外代理,网关在打开窗口前强制校验) ───
+async function startTiktokLogin() {
+  const browserBackend = await choosePreLoginBrowserBackend({ platform: "tiktok" });
+  if (browserBackend === null) return;
+  const proxy = await choosePreLoginProxy();
+  if (proxy === null) return;
+  const fingerprint = await configurePreLoginFingerprint(browserBackend);
+  if (fingerprint === null) return;
+  $("cookiebox").style.display = "none";
+  $("qrbox").style.display = "block";
+  $("qrstatus").textContent = "正在打开 TikTok 登录页…";
+  try {
+    const res = await api(loginStartUrl("/api/login/tiktok/start", proxy, browserBackend), loginStartOptions(fingerprint));
+    $("qrstatus").innerHTML = `${ic("i-eye")} <b>TikTok 登录页已打开</b>，请在窗口中扫码或用账号密码完成登录。<br>必须使用可用的海外代理；若提示出口地区不符，请更换代理后重试。<br>登录成功后会自动保存并关闭窗口。`;
+    pollLogin(res.task_id);
+  } catch (e) { $("qrstatus").textContent = "启动失败: " + e.message; toast("TikTok 登录启动失败:" + e.message, "err"); }
 }
 
 // ─── Cookie 登录 ───
@@ -2894,7 +3014,13 @@ function onHubAcc() {
   refreshHubPanel();
 }
 // 面板内子标签(我的作品/关注/粉丝/私信)切换
+const HUB_TAB_CAPS = { following: "follow_sync", fans: "follow_sync", dm: "dm",
+                        myworks: "own_works" };
 function switchHubTab(name) {
+  // 能力门:关注/粉丝需 follow_sync,私信需 dm;视频号无这些入口,
+  // 任何直达(含恢复旧 localStorage)都回到「我的作品」。
+  const cap = HUB_TAB_CAPS[name];
+  if (cap && !pfCan(PLATFORM, cap) && name !== "myworks") name = "myworks";
   HUB_TAB = name;
   try { localStorage.setItem("dym-hubtab", name); } catch (e) {}
   document.querySelectorAll("[data-hubpanel]").forEach(p => { p.style.display = p.dataset.hubpanel === name ? "" : "none"; });
@@ -3085,7 +3211,8 @@ async function syncWorkComments() {
   if (!WC_WORK) return;
   await withBusy(evtBtn(), "抓取中", async () => {
     try {
-      const r = await api("/api/account-works/" + WC_WORK.id + "/comments/sync", { method: "POST" });
+      const r = await api("/api/account-works/" + WC_WORK.id + "/comments/sync", { method: "POST", timeoutMs: 300000 });
+      if (r.timeout) { toast("抓取已超时停止:" + (r.error || "浏览器长时间无响应"), "err", 15000); return; }
       if (r.skipped) { toast(`抓取暂缓:${r.reason || "操作间隔尚未结束"}`, "info", 5000); return; }
       toast(`抓到 ${Number(r.fetched) || 0} 条,新增 ${Number(r.added) || 0}${transportSourceSuffix(r.source)}`, "ok");
     }
@@ -3096,7 +3223,7 @@ async function syncWorkComments() {
 
 // ── 关注 / 粉丝 ──
 // 小红书网页端不提供关注/粉丝列表(App 专属:实测无接口、无弹层),不做无用的同步
-const XHS_FOLLOW_NA = "小红书网页端不提供关注 / 粉丝列表(仅 App 可见),无法同步。抖音 / 快手可正常同步。";
+const XHS_FOLLOW_NA = "小红书网页端不提供关注 / 粉丝列表(仅 App 可见),无法同步。抖音 / TikTok / 快手可正常同步。";
 const FOLLOW_PAGE_SIZE = 50;
 const FOLLOW_STATE = {
   following: { page: 1, pages: 1, total: 0, query: "" },
@@ -3359,6 +3486,8 @@ async function syncDm() {
 async function openDmConv(convId) {
   DM_CONV = convId;
   DM_NEW_TARGET = "";
+  const csBar = $("dm-cs-bar");
+  if (csBar) csBar.style.display = "";
   const isCurrent = beginViewRequest("open-dm-conv", () => `${HUB_ACC}:${DM_CONV}`);
   const accountId = HUB_ACC;
   document.querySelectorAll("#dm-convs .dm-conv").forEach(e => e.classList.toggle("active", e.dataset.conv === convId));
@@ -3379,8 +3508,9 @@ function normalizeDmTarget(value) {
   if (!target) return "";
   try {
     const url = new URL(target);
-    if (url.protocol !== "https:" || !/(^|\.)douyin\.com$/i.test(url.hostname)) return "";
-    const match = url.pathname.match(/\/user\/([^/?#]+)/);
+    if (url.protocol !== "https:" || !/(^|\.)(douyin|tiktok)\.com$/i.test(url.hostname)) return "";
+    let match = url.pathname.match(/\/user\/([^/?#]+)/);
+    if (!match) match = url.pathname.match(/\/@([^/?#]+)/);
     if (!match) return "";
     target = decodeURIComponent(match[1]);
   } catch (_) {}
@@ -3389,22 +3519,32 @@ function normalizeDmTarget(value) {
 
 async function startNewDm() {
   if (!HUB_ACC) { toast("请先选择账号", "err"); return; }
-  if (PLATFORM !== "douyin") return;
+  if (PLATFORM !== "douyin" && PLATFORM !== "tiktok") return;
+  const isTiktok = PLATFORM === "tiktok";
   const raw = await uiPrompt({
     title: "发起新私信",
-    hint: "填写对方抖音号、主页链接或 sec_uid。抖音号会先精确解析为内部 UID。",
-    placeholder: "抖音号 / https://www.douyin.com/user/...",
+    hint: isTiktok
+      ? "填写对方 TikTok 号(@handle)或主页链接。TikTok 网页版不支持向陌生人发送首条私信，仅可回复已有会话。"
+      : "填写对方抖音号、主页链接或 sec_uid。抖音号会先精确解析为内部 UID。",
+    placeholder: isTiktok
+      ? "@handle / https://www.tiktok.com/@handle"
+      : "抖音号 / https://www.douyin.com/user/...",
   });
   if (raw === null) return;
   const target = normalizeDmTarget(raw);
   if (!target) { toast("目标用户不能为空", "err"); return; }
   DM_CONV = null;
   DM_NEW_TARGET = target;
+  const csBar0 = $("dm-cs-bar");
+  if (csBar0) csBar0.style.display = "none";
   document.querySelectorAll("#dm-convs .dm-conv").forEach(e => e.classList.remove("active"));
   const thread = $("dm-thread");
-  if (thread) thread.innerHTML = `<div class="empty"><div class="empty-ic">${ic("i-send")}</div><div class="empty-t">新私信</div><div class="empty-sub">目标 ${esc(target)}</div></div>`;
+  const degraded = isTiktok
+    ? `<div class="empty-sub" style="color:#e8a33d">注意：TikTok 网页版不支持向陌生人发送首条私信，请确保已有会话。</div>`
+    : "";
+  if (thread) thread.innerHTML = `<div class="empty"><div class="empty-ic">${ic("i-send")}</div><div class="empty-t">新私信</div><div class="empty-sub">目标 ${esc(target)}</div>${degraded}</div>`;
   const input = $("dm-input");
-  if (input) { input.placeholder = "输入第一条私信…"; input.focus(); }
+  if (input) { input.placeholder = isTiktok ? "回复已有会话…" : "输入第一条私信…"; input.focus(); }
 }
 
 function dmRuleSummary(rule) {
@@ -3593,8 +3733,9 @@ function populateAccountSelect() {
 function populateCollectionAccount() {
   const sel = $("col-account"); if (!sel) return;
   const current = sel.value;
-  const list = ACCOUNTS.filter(a => a.platform === "douyin" && a.status !== "invalid" && a.has_storage);
-  sel.innerHTML = accOptions(list, list.length ? "请选择抖音账号" : "暂无可用抖音账号");
+  const list = ACCOUNTS.filter(a => a.platform === PLATFORM && a.status !== "invalid" && a.has_storage);
+  const label = pfLabel(PLATFORM);
+  sel.innerHTML = accOptions(list, list.length ? `请选择${label}账号` : `暂无可用${label}账号`);
   if (list.some(a => String(a.id) === current)) sel.value = current;
   else if (list.length) sel.value = String(list[0].id);
   if (sel._csSync) sel._csSync();
@@ -3870,7 +4011,7 @@ async function toggleBrowserRuntime(runtimeId, enabled) {
 async function deleteBrowserRuntime(runtimeId) {
   if (!await uiConfirm({
     title: "移除内核记录",
-    message: "仅移除 CreatorHub 中的内核记录，不会删除原安装目录中的浏览器文件。",
+    message: "仅移除 mmm 中的内核记录，不会删除原安装目录中的浏览器文件。",
     okText: "移除",
   })) return;
   try {
@@ -4334,10 +4475,10 @@ function transportSourceSuffix(source) {
 function renderTransportMatrix(data) {
   const body = $("transport-matrix-body"), isolation = $("transport-isolation-body");
   if (!body || !isolation) return;
-  const platformNames = { douyin: "抖音", xhs: "小红书", kuaishou: "快手", shipinhao: "视频号" };
+  const platformNames = pfLabel;
   const rows = Array.isArray(data?.rows) ? data.rows : [];
   body.innerHTML = rows.length ? rows.map(row => `<tr>
-    <td><b>${esc(platformNames[row.platform] || row.platform)}</b></td>
+    <td><b>${esc(platformNames(row.platform) || row.platform)}</b></td>
     <td>${esc(row.label || row.operation)}</td>
     <td>${transportSupportTag(!!row.api, "API")}</td>
     <td>${transportSupportTag(!!row.browser, "浏览器")}</td>
@@ -4348,7 +4489,7 @@ function renderTransportMatrix(data) {
   isolation.innerHTML = accounts.length ? accounts.map(account => {
     const badge = (ok, yes, no) => `<span class="pill ${ok ? "done" : "pending"} bare">${esc(ok ? yes : no)}</span>`;
     return `<tr>
-      <td><b>${esc(account.nickname || `账号 #${account.account_id}`)}</b><div class="isolation-note">${esc(platformNames[account.platform] || account.platform)} · #${Number(account.account_id) || "-"}</div></td>
+      <td><b>${esc(account.nickname || `账号 #${account.account_id}`)}</b><div class="isolation-note">${esc(platformNames(account.platform) || account.platform)} · #${Number(account.account_id) || "-"}</div></td>
       <td>${badge(account.profile_isolated, "独立", "缺失/重复")}</td>
       <td><div class="isolation-stack">${badge(account.credential_isolated, "登录态独立", "登录态待检查")}${badge(account.api_session_isolated, "会话独立", "会话共享")}${badge(account.api_environment_aligned, "参数对齐", "参数未对齐")}</div></td>
       <td>${badge(account.network_isolated, "专属代理", account.network_scope || "共享出口")}</td>
@@ -4480,7 +4621,9 @@ function filterShareAccounts() {
   const old = sel.value;
   const platform = shareAccountPlatform();
   const hasDetectedLink = !!SHARE_LINKS.length;
-  const knownAccountPlatform = ["douyin", "xhs", "kuaishou", "shipinhao"].includes(platform);
+  // shipinhao 的历史下载走通用提取器,保留显式白名单;其余平台按注册表能力放行
+  const knownAccountPlatform = ["douyin", "xhs", "kuaishou", "shipinhao"].includes(platform)
+    || pfCan(platform, "link_download");
   const rows = knownAccountPlatform
     ? SHARE_ACCOUNTS.filter(a => a.platform === platform)
     : [];
@@ -4493,7 +4636,7 @@ function filterShareAccounts() {
   sel.innerHTML =
     `<option value="">${esc(emptyLabel)}</option>` +
     rows.map(a =>
-      `<option value="${a.id}">${esc(PF_NAME[a.platform] || a.platform || "账号")} · ${esc(a.nickname || ("账号 " + a.id))}${a.status === "invalid" ? "（登录态可能失效）" : ""}</option>`
+      `<option value="${a.id}">${esc(pfLabel(a.platform) || a.platform || "账号")} · ${esc(a.nickname || ("账号 " + a.id))}${a.status === "invalid" ? "（登录态可能失效）" : ""}</option>`
     ).join("");
 
   if (rows.some(a => String(a.id) === old)) {
@@ -5125,7 +5268,7 @@ async function createCollection() {
       const job = await api("/api/collections", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          platform: "douyin", account_id: accountId, keywords,
+          platform: PLATFORM, account_id: accountId, keywords,
           max_contents_per_keyword: contentLimit,
           max_pages_per_keyword: pageLimit,
           stagnant_pages: stagnantPages,
@@ -5172,7 +5315,7 @@ function renderCollectionJobs() {
       ((job.keywords || []).length > 5 ? `<span class="meta-chip more">+${job.keywords.length - 5}</span>` : "");
     const canCancel = ["pending", "running"].includes(job.status);
     const canRetry = ["done", "partial", "failed", "canceled"].includes(job.status);
-    const canEdit = canRetry && job.platform === "douyin";
+    const canEdit = canRetry && ["douyin", "tiktok"].includes(job.platform);
     const errorText = collectionLastError(job);
     const sortLabel = { general: "综合", latest: "最新", most_liked: "最多点赞" }[job.search_sort] || "综合";
     const timeLabel = { all: "不限时间", day: "一天内", week: "一周内", half_year: "半年内" }[job.publish_time] || "不限时间";
@@ -5197,9 +5340,9 @@ function renderCollectionJobs() {
 }
 async function refreshCollections() {
   const isCurrent = beginViewRequest("collections");
-  if (!$("collection-job-table") || PLATFORM !== "douyin") return;
+  if (!$("collection-job-table") || !pfCan(PLATFORM, "keyword_collection")) return;
   try {
-    const jobs = await api("/api/collections?platform=douyin");
+    const jobs = await api(`/api/collections?platform=${encodeURIComponent(PLATFORM)}`);
     if (!isCurrent()) return;
     COLLECTION_JOBS = jobs;
     const active = COLLECTION_JOBS.filter(j => ["pending", "running"].includes(j.status)).length;
@@ -5220,7 +5363,7 @@ async function refreshCollections() {
 async function editCollection(jobId, draft = null) {
   const job = COLLECTION_JOBS.find(item => item.id === Number(jobId));
   if (!job) return;
-  const accounts = ACCOUNTS.filter(a => a.platform === "douyin" && a.status !== "invalid" && a.has_storage);
+  const accounts = ACCOUNTS.filter(a => a.platform === job.platform && a.status !== "invalid" && a.has_storage);
   const initial = draft || {
     account_id: job.account_id,
     keywords: (job.keywords || []).join("\n"),
@@ -5245,7 +5388,7 @@ async function editCollection(jobId, draft = null) {
       <div class="form-field"><label for="ecol-keywords">关键词 <span class="field-scope">最多 20 个</span></label>
         <textarea id="ecol-keywords" rows="5" placeholder="每行一个关键词">${esc(initial.keywords)}</textarea></div>
       <div class="form-grid">
-        <div class="form-field"><label for="ecol-account">使用账号</label><select id="ecol-account">${accOptions(accounts, accounts.length ? "请选择抖音账号" : "暂无可用抖音账号")}</select></div>
+        <div class="form-field"><label for="ecol-account">使用账号</label><select id="ecol-account">${accOptions(accounts, accounts.length ? `请选择${pfLabel(job.platform)}账号` : `暂无可用${pfLabel(job.platform)}账号`)}</select></div>
         <div class="form-field"><label for="ecol-quality">视频画质</label><select id="ecol-quality"><option value="highest">原画 / 最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>
         <div class="form-field"><label for="ecol-content-limit">每词作品上限</label><input id="ecol-content-limit" type="number" min="1" max="100" value="${Number(initial.max_contents_per_keyword) || 20}"></div>
         <div class="form-field"><label for="ecol-comment-limit">每作品评论上限</label><input id="ecol-comment-limit" type="number" min="0" max="200" value="${Number(initial.max_comments_per_content) || 0}"></div>
@@ -5298,14 +5441,14 @@ async function editCollection(jobId, draft = null) {
         const keywords = parseCollectionKeywords(value.keywords);
         if (!keywords.length) uiEditorError("请至少填写一个关键词", "ecol-keywords");
         if (keywords.length > 20) uiEditorError("单个任务最多 20 个关键词", "ecol-keywords");
-        if (!value.account_id) uiEditorError("请选择一个可用抖音账号", "ecol-account");
+        if (!value.account_id) uiEditorError(`请选择一个可用${pfLabel(job.platform)}账号`, "ecol-account");
         if (value.max_contents_per_keyword < 1 || value.max_contents_per_keyword > 100) uiEditorError("每词作品上限须为 1–100", "ecol-content-limit");
         if (value.max_pages_per_keyword < 1 || value.max_pages_per_keyword > 40) uiEditorError("每词采集深度须为 1–40 页", "ecol-page-limit");
         if (value.stagnant_pages < 1 || value.stagnant_pages > 8) uiEditorError("连续无新增停止阈值须为 1–8 页", "ecol-stagnant-pages");
         if (value.min_likes < 0 || value.min_comments < 0) uiEditorError("点赞和评论门槛须为非负整数", "ecol-min-likes");
         if (value.max_comments_per_content < 0 || value.max_comments_per_content > 200) uiEditorError("每作品评论上限须为 0–200", "ecol-comment-limit");
         return api(`/api/collections/${job.id}`, {
-          method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...value, platform: "douyin", keywords }),
+          method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...value, platform: job.platform, keywords }),
         });
       },
     });
@@ -5832,8 +5975,8 @@ async function refreshMonitors() {
 }
 async function runNow(id) {
   const btn = evtBtn();
-  toast("抓取中…正在按配置的获取方式读取作品", "info", 7000);
-  await withBusy(btn, "抓取中", async () => {
+  // 抓取耗时较长(启动浏览器+翻页),仅保留按钮忙态,完成后再弹结果。
+  await withBusy(btn, "抓取中…", async () => {
     try {
       const r = await api("/api/monitors/" + id + "/run-now", { method: "POST" });
       if (r.skipped) toast(r.reason || "本轮已跳过，请查看监控状态", "info", 6000);
@@ -6388,11 +6531,22 @@ async function editDanmakuWatch(id) {
 }
 async function scanDanmakuWatch(id) {
   const btn = evtBtn();
-  toast("抓取中…正在加载视频弹幕", "info", 7000);
-  await withBusy(btn, "抓取中", async () => {
+  // 抓取耗时较长,仅保留按钮忙态,完成后再弹结果。
+  await withBusy(btn, "抓取中…", async () => {
     try {
-      const result = await api("/api/danmaku-watches/" + id + "/scan-now", { method: "POST" });
-      toast("弹幕抓取完成,新增 " + (result.new_danmaku ?? 0) + " 条", "ok");
+      const result = await api("/api/danmaku-watches/" + id + "/scan-now", { method: "POST", timeoutMs: 300000 });
+      if (result.timeout) {
+        toast("抓取已超时停止:" + (result.error || "浏览器长时间无响应"), "err", 15000);
+        return;
+      }
+      if (result.skipped && result.reason) {
+        toast("已延后抓取:" + result.reason, "info", 10000);
+        return;
+      }
+      const dn = result.new_danmaku ?? 0;
+      if (dn > 0) toast(`弹幕抓取完成,新增 ${dn} 条`, "ok");
+      else if (result.error) toast(`抓取完成,新增 0 条:${result.error}`, "err", 15000);
+      else toast("弹幕抓取完成,新增 0 条(没有新弹幕或均为历史已见)", "info", 8000);
     } catch (e) { toast("抓取失败:" + e.message, "err"); }
   });
   refreshDanmakuWatches(); refreshDanmaku();
@@ -6555,9 +6709,9 @@ async function addWatch() {
   if (normalizedTarget === null) return;
   const url_or_id = $("w-url").value.trim();
   if (!url_or_id) { toast("请粘贴视频链接 / 账号主页 / sec_uid", "err"); return; }
-  if (PLATFORM === "xhs" && !$("w-acc").value) {
-    if (!ACCOUNTS.length) { toast("请先在「账号」里完成小红书扫码登录", "err"); switchTab("accounts"); return; }
-    toast("小红书评论监控必须选择一个已登录账号", "err"); return;
+  if (!$("w-acc").value) {
+    if (!ACCOUNTS.length) { toast("请先在「账号」里完成平台账号登录", "err"); switchTab("accounts"); return; }
+    toast("评论监控必须选择一个已登录账号（匿名抓取易被风控拦截）", "err"); return;
   }
   $("w-msg").textContent = "解析中…";
   await withBusy(btn, "解析中", async () => {
@@ -6566,7 +6720,7 @@ async function addWatch() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           url_or_id, platform: PLATFORM, kind: $("w-kind").value,
-          mode: PLATFORM === "xhs" ? "public" : $("w-mode").value,
+          mode: (PLATFORM === "xhs" || PLATFORM === "tiktok") ? "public" : $("w-mode").value,
           account_id: $("w-acc").value ? +$("w-acc").value : null,
           interval_seconds: monitorIntervalSeconds("w-interval"),
           recent_works: +$("w-recent").value,
@@ -6709,10 +6863,25 @@ async function editWatchMeta(id) {
 }
 async function scanWatch(id) {
   const btn = evtBtn();
-  toast("抓取中…正在拉取评论区", "info", 7000);
-  await withBusy(btn, "抓取中", async () => {
-    try { const r = await api("/api/comment-watches/" + id + "/scan-now", { method: "POST" }); toast(`评论抓取完成,新增 ${r.new_comments ?? 0} 条`, "ok"); }
-    catch (e) { toast("抓取失败:" + e.message, "err"); }
+  // 抓取(启动浏览器+翻评论)可能耗时数十秒,仅让按钮显示忙态,完成后再弹结果,
+  // 避免点击瞬间就弹提示让用户误以为已运行结束。
+  await withBusy(btn, "抓取中…", async () => {
+    try {
+      const r = await api("/api/comment-watches/" + id + "/scan-now", { method: "POST", timeoutMs: 300000 });
+      if (r.timeout) {
+        toast("抓取已超时停止:" + (r.error || "浏览器长时间无响应"), "err", 15000);
+        return;
+      }
+      if (r.skipped && r.reason) {
+        toast(`已延后抓取:${r.reason}`, "info", 10000);
+        return;
+      }
+      const n = r.new_comments ?? 0;
+      if (n > 0) toast(`评论抓取完成,新增 ${n} 条`, "ok");
+      else if (r.error) toast(`抓取完成,新增 0 条:${r.error}`, "err", 15000);
+      else toast("评论抓取完成,新增 0 条(没有新评论或均为历史已见评论)", "info", 8000);
+    }
+    catch (e) { toast("抓取失败:" + e.message, "err", 15000); }
   });
   refreshWatches(); refreshComments();
 }
@@ -6816,7 +6985,13 @@ async function refreshComments(resetPage = false) {
     <td class="mut comment-user watch-record-user" data-label="用户"><div>${esc(r.user_nickname || "")}</div>${r.user_sec_uid ? `<div class="comment-user-sec" title="${esc(r.user_sec_uid)}">sec_uid: ${esc(r.user_sec_uid)}</div>` : ""}</td>
     <td class="mut num watch-record-likes" data-label="赞">${fmtNum(r.like_count)}</td>
     <td class="watch-record-time">${watchRecordTimeMarkup("comment", r)}</td>
-    <td class="acttd watch-record-actions"><button class="ghost sm danger" onclick="delComment(${r.id})">${ic("i-trash")}删除</button></td>
+    <td class="acttd watch-record-actions">
+      <button class="ghost sm" type="button" title="转入客服接待，回复将自动回投本评论"
+        onclick="csTakeoverComment(this)"
+        data-aweme="${cssAttr(r.aweme_id || "")}" data-cid="${cssAttr(r.comment_id || "")}"
+        data-watch="${cssAttr(r.watch_id || 0)}"
+        data-nick="${cssAttr(r.user_nickname || "")}" data-text="${cssAttr((r.text || "").slice(0, 200))}">${ic("i-msg")}转人工</button>
+      <button class="ghost sm danger" onclick="delComment(${r.id})">${ic("i-trash")}删除</button></td>
   </tr>`;
   }).join("") || empty(6, "暂无评论", "i-msg", "添加评论监控后,抓到的新评论会显示在这里,并可推送通知");
   updateCommentSelBar(); renderCommentPager(meta);
@@ -6981,7 +7156,9 @@ function populatePubAcc() {
   const list = PLATFORM === "xhs" ? ACCOUNTS.filter(a => a.has_creator) : ACCOUNTS;
   const ph = list.length ? "选择发布账号"
     : (PLATFORM === "kuaishou" ? "请先完成「快手扫码登录」"
-      : PLATFORM === "douyin" ? "请先完成「抖音扫码/创作者登录」" : "请先完成「小红书创作者登录」");
+      : PLATFORM === "douyin" ? "请先完成「抖音扫码/创作者登录」"
+      : PLATFORM === "tiktok" ? "请先完成「TikTok 网页登录」"
+      : "请先完成「小红书创作者登录」");
   sel.innerHTML = accOptions(list, ph);
   if (list.length) sel.value = String(list[0].id);
 }
@@ -7114,12 +7291,12 @@ async function editPublish(id) {
         <input type="datetime-local" id="ep-when" aria-label="定时发布（留空=尽快发）"></div>
       ${task.platform === "shipinhao" ? `<div><label class="field" for="ep-location">位置</label>
         <input id="ep-location" value="${esc(task.location || "")}" placeholder="城市或地点名"></div>` : ""}
-      ${task.platform === "douyin" ? `<fieldset class="publish-permissions">
+      ${["douyin", "tiktok"].includes(task.platform) ? `<fieldset class="publish-permissions">
         <legend>互动与权限</legend>
         <div class="publish-permission"><label class="field" for="ep-visibility">谁可以看</label>
           <select id="ep-visibility"><option value="public">公开</option><option value="friends">好友可见</option><option value="private">仅自己可见</option></select></div>
-        <div class="publish-permission"><label class="field" for="ep-allowsave">保存权限</label>
-          <select id="ep-allowsave"><option value="1">允许他人保存</option><option value="0">不允许</option></select></div>
+        ${task.platform === "douyin" ? `<div class="publish-permission"><label class="field" for="ep-allowsave">保存权限</label>
+          <select id="ep-allowsave"><option value="1">允许他人保存</option><option value="0">不允许</option></select></div>` : ""}
       </fieldset>` : ""}`;
     $("ep-account").value = task.account_id ? String(task.account_id) : "";
     $("ep-when").value = localDateTimeValue(task.scheduled_at);
@@ -7162,6 +7339,7 @@ async function refreshPublish() {
     </td></tr>`).join("") || empty(7, "暂无发布任务", "i-send",
       PLATFORM === "kuaishou" ? "上传图集/视频加入队列(发布到快手创作平台)"
       : PLATFORM === "douyin" ? "上传图集/视频加入队列(发布到抖音创作平台)"
+      : PLATFORM === "tiktok" ? "上传图集/视频加入队列(发布到 TikTok 创作者中心)"
       : "上传图集/视频加入队列,或在抖音作品上点「发小红书」转发过来");
 }
 // 快手创作页、视频号管理页都必须复用账号自己的登录态，不能交给系统浏览器。
@@ -7442,13 +7620,15 @@ function onAcMode() {
   onAcKind();
 }
 function onAcKind() {
-  const mode = $("ac-mode").value, kind = $("ac-kind").value, xhs = PLATFORM === "xhs";
+  const mode = $("ac-mode").value, kind = $("ac-kind").value, xhs = PLATFORM === "xhs", tt = PLATFORM === "tiktok";
   let show = true, label = "目标", ph = "";
   if (mode === "auto_reply") {
     if (kind === "self") show = false;
+    else if (tt) { label = "视频链接 / id"; ph = "https://www.tiktok.com/@用户/video/<id> 或纯数字 id"; }
     else { label = xhs ? "笔记链接 / id" : "作品链接 / id"; ph = xhs ? "explore 链接 / xhslink / note_id" : "作品链接 / 短链 / 数字 id"; }
   } else {
     if (kind === "keyword") { label = "搜索关键词"; ph = "例如:露营装备 / 口红试色"; }
+    else if (tt) { label = "博主主页 / TikTok 号"; ph = "https://www.tiktok.com/@用户名 或 @handle"; }
     else { label = xhs ? "博主主页 / id" : "博主主页 / sec_uid"; ph = xhs ? "主页链接 / xhslink / user_id" : "主页链接 / 短链 / sec_uid"; }
   }
   $("ac-target-wrap").style.display = show ? "" : "none";
@@ -7458,8 +7638,7 @@ function onAcKind() {
 }
 function populateAcAccount() {
   const sel = $("ac-acc"); if (!sel) return;
-  const xhs = PLATFORM === "xhs";
-  sel.innerHTML = accOptions(ACCOUNTS, xhs ? "请选择小红书账号(必选)" : "请选择抖音账号(必选)");
+  sel.innerHTML = accOptions(ACCOUNTS, `请选择${pfLabel(PLATFORM)}账号(必选)`);
   if (ACCOUNTS.length) sel.value = String(ACCOUNTS[0].id);
   csSyncAll();
 }
@@ -7505,13 +7684,15 @@ function emOnMode() {
   emOnKind();
 }
 function emOnKind() {
-  const mode = $("em-mode").value, kind = $("em-kind").value, xhs = EM_PF === "xhs";
+  const mode = $("em-mode").value, kind = $("em-kind").value, xhs = EM_PF === "xhs", tt = EM_PF === "tiktok";
   let show = true, label = "目标", ph = "";
   if (mode === "auto_reply") {
     if (kind === "self") show = false;
+    else if (tt) { label = "视频链接 / id"; ph = "https://www.tiktok.com/@用户/video/<id> 或纯数字 id"; }
     else { label = xhs ? "笔记链接 / id" : "作品链接 / id"; ph = xhs ? "explore / xhslink / note_id" : "作品链接 / 短链 / 数字 id"; }
   } else {
     if (kind === "keyword") { label = "搜索关键词"; ph = "例如:露营装备 / 口红试色"; }
+    else if (tt) { label = "博主主页 / TikTok 号"; ph = "https://www.tiktok.com/@用户名 或 @handle"; }
     else { label = xhs ? "博主主页 / id" : "博主主页 / sec_uid"; ph = xhs ? "主页 / xhslink / user_id" : "主页 / 短链 / sec_uid"; }
   }
   $("em-target-wrap").style.display = show ? "" : "none";
@@ -7523,7 +7704,7 @@ function emOnKind() {
 function editRule(id) {
   const r = AC_RULES.find(x => x.id === id); if (!r) return;
   EM_PF = r.platform;
-  const accOpts = accOptions(ACCOUNTS.filter(a => a.platform === EM_PF), EM_PF === "xhs" ? "请选择小红书账号" : "请选择抖音账号");
+  const accOpts = accOptions(ACCOUNTS.filter(a => a.platform === EM_PF), `请选择${pfLabel(EM_PF)}账号`);
   new Promise(res => {
     _uiResolve = res; _uiCancelVal = null;
     _uiGetVal = () => ({
@@ -7636,7 +7817,7 @@ async function runRule(id) {
       const r = await api("/api/comment-rules/" + id + "/run-now", { method: "POST" });
       if (!r.ok) toast("未生成:" + (r.error || ""), "err", 7000);
       else if (r.created > 0) toast(`生成 ${r.created} 条${r.manual_only ? "人工发布草稿(未调用评论接口)" : r.review ? "草稿(待人工通过)" : "任务"}(发现 ${r.candidates} 个目标)`, "ok", 6000);
-      else toast(`发现 ${r.candidates} 个目标,生成 0 条` + (r.note ? `:${r.note}` : "(可能都已生成过)"), "info", 9000);
+      else toast(`发现 ${r.candidates} 个目标,生成 0 条` + (r.note ? `:${r.note}` : (r.error ? `:${r.error}` : "(可能都已生成过)")), "info", 15000);
     } catch (e) { toast("试跑失败:" + e.message, "err"); }
   });
   refreshCommentRules(); refreshCommentTasks();
@@ -7661,8 +7842,9 @@ async function refreshCommentTasks() {
   $("ac-task-table").innerHTML = rows.map(t => {
     const isDraft = t.status === "draft", canSend = t.status === "pending" || t.status === "failed";
     return `<tr>
+    <td class="mut wrap" style="max-width:180px" title="${esc((t.target_text || '').slice(0,300))}">${esc((t.target_text || '').slice(0,60)) || '<span class="mut">—</span>'}</td>
     <td class="wrap" style="max-width:240px">${esc(t.content)}</td>
-    <td class="mut">${esc((t.aweme_id || "").slice(0, 16))}</td>
+    <td class="mut" style="max-width:200px">${esc(t.work_title || "")}${t.work_title ? `<div class="mut">${esc((t.aweme_id || "").slice(0, 16))}</div>` : esc((t.aweme_id || "").slice(0, 16))}</td>
     <td>${t.target_comment_id ? "回复 " + esc(t.target_nick || "") : "顶层评论"}</td>
     <td class="mut num">${t.scheduled_at ? new Date(t.scheduled_at + "Z").toLocaleString() : "尽快"}${t.next_allowed_at ? `<div class="mut" title="预约保持不变，同时等待风控间隔结束">风控最早 ${esc(riskTime(t.next_allowed_at))}</div>` : ""}</td>
     <td class="mut">${t.method === "browser" ? "浏览器页面" : t.method === "api" ? "API 兼容模式" : t.method === "manual" ? "人工草稿" : "—"}</td>
@@ -7674,7 +7856,7 @@ async function refreshCommentTasks() {
       ${(isDraft || canSend) ? `<button class="ghost sm" onclick="cancelTask(${t.id})">${isDraft ? "弃用" : "取消"}</button>` : ""}
       ${t.status === "uncertain" ? `<button class="ghost sm" onclick="resolveTaskResult('comments',${t.id})">核对结果</button>` : t.status !== "doing" ? `<button class="ghost sm danger" onclick="delTask(${t.id})">${ic("i-trash")}删除</button>` : ""}
     </td></tr>`;
-  }).join("") || empty(7, "暂无评论任务", "i-msg", "启用规则或点「试跑」后,这里会出现待发评论");
+  }).join("") || empty(8, "暂无评论任务", "i-msg", "启用规则或点「试跑」后,这里会出现待发评论");
 }
 async function approveTask(id) {
   try { await api("/api/comment-tasks/" + id + "/approve", { method: "POST" }); toast("已通过,转入待发队列", "ok"); refreshCommentTasks(); }
@@ -7986,7 +8168,7 @@ $("collection-content-list").innerHTML = collectionResultSkeleton(4);
 $("queue-table").innerHTML = skeleton(7);
 
 // restore last-selected section (default: 总览);旧版四个独立页已并入「账号管理」
-const VALID_TABS = ["overview", "accounts", "risk-control", "queue", "collections", "monitors", "comments", "danmaku", "hub", "publish", "autocomment", "share-download", "notifications", "settings"];
+const VALID_TABS = ["overview", "accounts", "risk-control", "queue", "collections", "monitors", "comments", "danmaku", "hub", "publish", "autocomment", "share-download", "notifications", "cs", "settings"];
 const LEGACY_HUB_TABS = ["myworks", "following", "fans", "dm"];
 switchTab((() => {
   try {
@@ -8000,13 +8182,14 @@ switchTab((() => {
 switchHubTab(HUB_TAB);   // 恢复上次停留的子标签(我的作品/关注/粉丝/私信)
 
 // restore last-selected platform (default: 抖音)
-PLATFORM = (() => { try { const p = localStorage.getItem("dym-pf"); return ["xhs", "douyin", "kuaishou", "shipinhao"].includes(p) ? p : "douyin"; } catch (e) { return "douyin"; } })();
+PLATFORM = (() => { try { const p = localStorage.getItem("dym-pf"); return ["xhs", "douyin", "kuaishou", "shipinhao", "tiktok"].includes(p) ? p : "douyin"; } catch (e) { return "douyin"; } })();
 applyPlatformUI();
 updateTaskQueuePlatformLabel();
 
 setupMonitorInterval("t-interval", 300);
 setupMonitorInterval("w-interval", 600);
 setupMonitorInterval("d-w-interval", 0, true);
+loadPlatformCatalog();
 onTypeChange(); bindPubFilePicker(); onPubType(); populateWatchAccount(); applyDanmakuForm(); onAcMode(); loadSettings(); refreshAccounts(); refreshBrowserRuntimes(); refreshProxies(); refreshChannels(); loop();
 enhanceAllSelects();   // 把所有原生 <select> 升级为美化下拉
 enhanceAllMetaControls(); // 分组/标签：当前平台词库下拉，可搜索并新增
@@ -8083,3 +8266,933 @@ window.CreatorHubBridge = {
     await Promise.allSettled((refreshers[CURRENT_TAB] || []).map(fn => Promise.resolve().then(() => fn())));
   },
 };
+
+// ═══════════════════════ 人工客服（CS）模块 ═══════════════════════
+const CsPanel = {
+  token: "", agent: null, convs: [], current: null, filter: "queued",
+  sourceFilter: "", unreadOnly: false, quickReplies: [],
+  lastMsgId: 0, sse: null, listTimer: null, countTimer: null,
+  agents: [], busy: false,
+
+  get authed() { return !!this.token && !!this.agent; },
+  // 客服服务器地址：留空 = 本机同源；远程填 http://IP:端口，存 localStorage。
+  base() {
+    let b = "";
+    try { b = (localStorage.getItem("mmm_cs_base") || "").trim(); } catch (e) {}
+    return b.replace(/\/+$/, "");
+  },
+  setBase(v) {
+    try { localStorage.setItem("mmm_cs_base", (v || "").trim().replace(/\/+$/, "")); } catch (e) {}
+  },
+  headers(json) {
+    const h = { Authorization: "Bearer " + this.token };
+    if (json) h["Content-Type"] = "application/json";
+    return h;
+  },
+  async call(path, opts = {}) {
+    opts.headers = Object.assign(this.headers(opts.body !== undefined), opts.headers || {});
+    const r = await api(this.base() + path, opts);
+    return r;
+  },
+
+  async init() {
+    try { this.token = localStorage.getItem("mmm_cs_token") || ""; } catch (e) { this.token = ""; }
+    const srv = $("cs-server");
+    if (srv && !srv.value) srv.value = this.base();
+    loadCsNodeConfig();
+    const input = $("cs-input");
+    if (input) {
+      input.addEventListener("keydown", e => {
+        if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); csSend(); }
+      });
+    }
+    if (!this.token) { this.showLogin(); return; }
+    try {
+      this.agent = await this.call("/api/cs/agent/me");
+      this.enterApp();
+    } catch (e) {
+      this.token = "";
+      try { localStorage.removeItem("mmm_cs_token"); } catch (_) {}
+      this.showLogin();
+    }
+  },
+
+  showLogin() {
+    $("cs-login-card").style.display = "";
+    $("cs-app").style.display = "none";
+    $("cs-admin-btn").hidden = true;
+    $("cs-list").innerHTML = "";
+    $("cs-chat-head").innerHTML = "";
+    this.renderComposer(null);
+    this.stopStream();
+  },
+
+  enterApp() {
+    $("cs-login-card").style.display = "none";
+    $("cs-app").style.display = "";
+    const me = $("cs-me");
+    me.innerHTML = `当前坐席：<b>${esc(this.agent.display_name || this.agent.username)}</b>` +
+      (this.agent.role === "admin" ? "（管理员）" : "");
+    $("cs-admin-btn").hidden = this.agent.role !== "admin";
+    this.refreshCounts();
+    this.refreshConvs();
+    this.startStream();
+    this.registerSW();
+    this.requestNotifyPermission();
+    clearInterval(this.listTimer);
+    this.listTimer = setInterval(() => { if (this.authed && !document.hidden) this.refreshConvs(true); }, 15000);
+    // 切后台恢复：回到前台时刷新列表与会话
+    if (!this._visHandler) {
+      this._visHandler = () => {
+        if (document.visibilityState === "visible" && this.authed) {
+          this.refreshCounts();
+          this.refreshConvs(true);
+          if (this.sse && this.sse.readyState === EventSource.CLOSED) this.startStream();
+        }
+      };
+      document.addEventListener("visibilitychange", this._visHandler);
+    }
+  },
+
+  registerSW() {
+    if (!("serviceWorker" in navigator)) return;
+    if (this._swRegistered) return;
+    this._swRegistered = true;
+    navigator.serviceWorker.register("/cs-sw.js", { scope: "/" })
+      .catch(() => {});
+  },
+
+  requestNotifyPermission() {
+    if (!("Notification" in window)) return;
+    if (Notification.permission === "granted" || Notification.permission === "denied") return;
+    // 延迟请求，避免登录时突兀弹窗
+    setTimeout(() => {
+      try { Notification.requestPermission(); } catch (e) {}
+    }, 2000);
+  },
+
+  // ── 通知：声音 + 系统通知 + 标题角标 ──
+  _origTitle: document.title,
+  notifySound() {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      const actx = this._actx || (this._actx = new Ctx());
+      if (actx.state === "suspended") actx.resume();
+      const o = actx.createOscillator();
+      const g = actx.createGain();
+      o.connect(g); g.connect(actx.destination);
+      o.type = "sine"; o.frequency.value = 880;
+      g.gain.setValueAtTime(0.001, actx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.2, actx.currentTime + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + 0.3);
+      o.start(); o.stop(actx.currentTime + 0.3);
+    } catch (e) {}
+  },
+
+  sysNotify(title, body) {
+    try {
+      if (!("Notification" in window) || Notification.permission !== "granted") return;
+      const n = new Notification(title, { body: body, tag: "cs-" + Date.now() });
+      n.onclick = () => { window.focus(); n.close(); };
+      setTimeout(() => n.close(), 8000);
+    } catch (e) {}
+  },
+
+  updateTitleBadge(count) {
+    const base = this._origTitle || "mmm";
+    document.title = count > 0 ? `(${count > 99 ? "99+" : count}) ${base}` : base;
+  },
+
+  onIncoming(convId, text) {
+    // 页面在后台或不在当前会话时才提醒
+    const bg = document.hidden || (this.current !== convId);
+    if (!bg) return;
+    this.notifySound();
+    const name = "新消息";
+    this.sysNotify("客服新消息", text || "有新的客户消息");
+  },
+
+  startStream() {
+    this.stopStream();
+    this._sseRetry = 0;
+    if (!this.token) return;
+    try {
+      const es = new EventSource(this.base() + "/api/cs/agent/stream?token=" + encodeURIComponent(this.token));
+      this.sse = es;
+      es.addEventListener("open", () => {
+        this._sseRetry = 0;
+        // 重连后补拉未读与列表
+        this.refreshCounts();
+        this.refreshConvs(true);
+      });
+      es.addEventListener("message", ev => {
+        let evt; try { evt = JSON.parse(ev.data); } catch (e) { return; }
+        if (evt.type === "hello") { this.applyCounts(evt.counts); return; }
+        if (evt.type === "conversation") {
+          this.refreshConvs(true);
+          if (evt.conversation && this.current === evt.conv_id) this.renderHead(evt.conversation);
+        }
+        if (evt.type === "message" && evt.message) {
+          const m = evt.message;
+          if (m.conv_id === this.current) this.appendMessage(m);
+          else this.onIncoming(m.conv_id, m.text);
+          this.refreshConvs(true);
+        }
+        if (evt.type === "relayed") {
+          if (evt.conv_id === this.current) this.updateRelayTag(evt.message_id, evt.ok, evt.error);
+          this.refreshConvs(true);
+        }
+        if (evt.type === "relay_queued" && evt.conv_id === this.current) {
+          this.setRelayWaiting(evt.message_id);
+        }
+        this.refreshCounts();
+      });
+      es.onerror = () => {
+        // 浏览器 EventSource 会自动重连；这里做退避控制 + 状态提示
+        if (this._sseRetryTimer) return;
+        const delay = Math.min(1000 * Math.pow(2, this._sseRetry), 15000);
+        this._sseRetry = Math.min(this._sseRetry + 1, 6);
+        this._sseRetryTimer = setTimeout(() => {
+          this._sseRetryTimer = null;
+          // 若浏览器未自动重连则手动重建
+          if (!this.sse || this.sse.readyState === EventSource.CLOSED) this.startStream();
+        }, delay);
+      };
+    } catch (e) {}
+  },
+  stopStream() {
+    if (this.sse) { try { this.sse.close(); } catch (e) {} this.sse = null; }
+    if (this._sseRetryTimer) { clearTimeout(this._sseRetryTimer); this._sseRetryTimer = null; }
+  },
+
+  async login(username, password) {
+    const errBox = $("cs-login-err");
+    errBox.textContent = "";
+    try {
+      const r = await api(this.base() + "/api/cs/agent/login", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+      this.token = r.token; this.agent = r.agent;
+      try { localStorage.setItem("mmm_cs_token", r.token); } catch (e) {}
+      this.enterApp();
+    } catch (e) { errBox.textContent = e.message || "登录失败"; }
+  },
+
+  async logout() {
+    try { await this.call("/api/cs/agent/logout", { method: "POST" }); } catch (e) {}
+    this.token = ""; this.agent = null; this.convs = []; this.current = null;
+    try { localStorage.removeItem("mmm_cs_token"); } catch (e) {}
+    this.showLogin();
+  },
+
+  async refreshCounts() {
+    if (!this.authed) return;
+    try { this.applyCounts(await this.call("/api/cs/agent/counts")); } catch (e) {}
+  },
+  applyCounts(c) {
+    if (!c) return;
+    $("cs-c-q").textContent = c.queued || 0;
+    $("cs-c-a").textContent = c.active || 0;
+    const badge = $("tb-cs");
+    badge.textContent = c.queued || 0;
+    badge.hidden = !(c.queued > 0);
+    this.updateTitleBadge(c.queued || 0);
+  },
+
+  setFilter(f) {
+    this.filter = f;
+    document.querySelectorAll("#cs-filters button").forEach(b =>
+      b.classList.toggle("on", b.dataset.csfilter === f));
+    this.refreshConvs();
+  },
+
+  async refreshConvs(silent) {
+    if (!this.authed) return;
+    try {
+      const params = new URLSearchParams();
+      if (this.filter) params.set("status", this.filter);
+      if (this.sourceFilter) params.set("source", this.sourceFilter);
+      if (this.unreadOnly) params.set("unread_only", "1");
+      const qs = params.toString() ? "?" + params.toString() : "";
+      this.convs = await this.call("/api/cs/agent/conversations" + qs);
+      this.renderList();
+    } catch (e) { if (!silent) toast("会话列表加载失败：" + e.message, "err"); }
+  },
+
+  sourceLabel(src) {
+    if (src === "guest") return "访客链接";
+    const map = { douyin: "抖音", xhs: "小红书", kuaishou: "快手", shipinhao: "视频号" };
+    const [pf, kind] = src.split("_");
+    return (map[pf] || pf || "") + (kind === "dm" ? "私信" : kind === "comment" ? "评论" : src);
+  },
+
+  renderList() {
+    const box = $("cs-list");
+    if (!this.convs.length) {
+      box.innerHTML = `<div class="empty" style="padding:24px"><div class="empty-t">暂无会话</div><div class="empty-sub">${esc(this.filter === "queued" ? "没有排队中的客户" : "新建访客链接或从私信/评论转人工")}</div></div>`;
+      return;
+    }
+    // 未读优先，再按 last_time 倒序（服务端已按 status/last_time 排，这里微调未读置顶）
+    const sorted = [...this.convs].sort((a, b) => {
+      const au = a.unread_agent ? 1 : 0, bu = b.unread_agent ? 1 : 0;
+      if (au !== bu) return bu - au;
+      return (b.last_time || 0) - (a.last_time || 0);
+    });
+    box.innerHTML = sorted.map(c => {
+      const mine = c.owner && c.owner.id === this.agent.id;
+      const name = esc(c.customer_name || "未署名客户");
+      const unread = c.unread_agent ? ` <span class="unread">${c.unread_agent > 99 ? "99+" : c.unread_agent}</span>` : "";
+      const accCtx = c.account_name ? `<span class="acc-ctx" title="归属账号：${esc(c.account_name)}">· ${esc(c.account_name)}</span>` : "";
+      const closeBtn = c.status === "queued"
+        ? `<button class="ghost sm danger cs-conv-close" type="button" title="关闭排队会话" onclick="event.stopPropagation();csClose(${c.id})">${ic("i-trash")}</button>`
+        : "";
+      return `<div class="cs-conv${c.id === this.current ? " active" : ""}" onclick="csSelect(${c.id})">
+        <span class="dot ${c.status}"></span>
+        <div class="meta">
+          <b>${name}${unread}</b>
+          <div class="last">${esc(c.last_text || "（暂无消息）")}</div>
+          <div class="acc-line"><span class="badge-src">${esc(this.sourceLabel(c.source))}</span>${accCtx}</div>
+        </div>
+        ${closeBtn}
+      </div>`;
+    }).join("");
+  },
+
+  async select(id) {
+    this.current = id;
+    this.lastMsgId = 0;
+    // 移动端：进入会话视图
+    const wrap = document.querySelector(".cs-wrap");
+    if (wrap) wrap.classList.add("cs-conv-open");
+    this.renderList();
+    let conv;
+    try { conv = await this.call(`/api/cs/agent/conversations/${id}`); }
+    catch (e) { toast(e.message, "err"); return; }
+    this.renderHead(conv);
+    await this.loadMessages(id);
+    try { await this.call(`/api/cs/agent/conversations/${id}/read`, { method: "POST" }); } catch (e) {}
+    this.refreshConvs(true);
+  },
+
+  backToList() {
+    this.current = null;
+    const wrap = document.querySelector(".cs-wrap");
+    if (wrap) wrap.classList.remove("cs-conv-open");
+    this.renderList();
+  },
+
+  renderHead(c) {
+    const name = esc(c.customer_name || "未署名客户");
+    const owner = c.owner ? esc(c.owner.display_name || c.owner.username) : "未分配";
+    const parts = c.participants && c.participants.length
+      ? c.participants.map(p => esc(p.display_name || p.username)).join("、") : owner;
+    const statusText = { queued: "排队中", active: "接待中", closed: "已关闭" }[c.status] || c.status;
+    const acts = [];
+    if (c.status === "active") {
+      acts.push(`<button class="ghost sm" type="button" onclick="csOpenPicker('transfer',${c.id})">转接</button>`);
+      acts.push(`<button class="ghost sm" type="button" onclick="csOpenPicker('invite',${c.id})">邀请协作</button>`);
+    }
+    $("cs-chat-head").innerHTML =
+      `<button class="cs-back-btn" type="button" onclick="csBack()">‹ 返回</button>
+       <div class="who">${name} <span class="sub">[${esc(this.sourceLabel(c.source))} · ${statusText}]</span></div>
+       <div class="sub">参与客服：${parts}</div>
+       <div class="acts">${acts.join("")}</div>`;
+    this.renderComposer(c);
+  },
+
+  renderComposer(c) {
+    const box = $("cs-composer-acts");
+    if (!box) return;
+    if (!c) { box.innerHTML = ""; return; }
+    const parts = [];
+    if (c.status === "queued") {
+      parts.push(`<button class="sm" type="button" onclick="csAccept(${c.id})"><svg><use href="#i-check"/></svg>接单</button>`);
+    } else if (c.status === "active") {
+      const mine = c.owner && this.agent && c.owner.id === this.agent.id;
+      if (mine) parts.push(`<button class="ghost sm" type="button" title="无法受理时退回排队队列" onclick="csRelease(${c.id})">退回受理大厅</button>`);
+      parts.push(`<button class="ghost sm" type="button" onclick="csClose(${c.id})">结束会话</button>`);
+    }
+    box.innerHTML = parts.join("");
+    const inp = $("cs-input");
+    if (inp && c.status === "queued") inp.focus();
+  },
+
+  async loadMessages(id) {
+    try {
+      const msgs = await this.call(`/api/cs/agent/conversations/${id}/messages`);
+      const thread = $("cs-thread");
+      thread.innerHTML = msgs.length ? "" : `<div class="empty" style="margin:auto"><div class="empty-t">暂无消息</div></div>`;
+      this.lastMsgId = 0;
+      msgs.forEach(m => this.appendMessage(m, true));
+      thread.scrollTop = thread.scrollHeight;
+    } catch (e) { toast("消息加载失败：" + e.message, "err"); }
+  },
+
+  appendMessage(m, bulk) {
+    if (!m || (m.id && m.id <= this.lastMsgId)) return;
+    if (m.id) this.lastMsgId = Math.max(this.lastMsgId, m.id);
+    const thread = $("cs-thread");
+    const empty = thread.querySelector(".empty");
+    if (empty) empty.remove();
+    let node;
+    if (m.sender_kind === "system") {
+      node = document.createElement("div");
+      node.className = "cs-sys";
+      node.innerHTML = `<span>${esc(m.text)}</span>`;
+    } else {
+      const out = m.sender_kind === "agent";
+      node = document.createElement("div");
+      node.className = "cs-bubble " + (out ? "out" : "in");
+      node.dataset.msgId = m.id || "";
+      let relayTag = "";
+      if (out && m.relayed === true) relayTag = ` <span class="cs-relaytag ok">已回投平台</span>`;
+      else if (out && m.relayed === false) {
+        if (m.relay_state === "failed") {
+          const resendable = m.relay_resendable;
+          relayTag = ` <span class="cs-relaytag fail">回投失败：${esc(m.relay_error || "未知原因")}</span>`
+            + (resendable ? ` <button class="cs-resend-btn" type="button" onclick="csResend(${m.id})" title="重新排队回投">重发</button>` : "");
+        } else if (m.relay_state === "pending" || m.relay_state === "claimed") relayTag = ` <span class="cs-relaytag wait">等待工作台回投…</span>`;
+        else relayTag = ` <span class="cs-relaytag wait">回投平台中…</span>`;
+      }
+      node.innerHTML =
+        (out ? "" : `<span class="who">${esc(m.sender_name || "客户")}</span>`) +
+        esc(m.text) +
+        `<span class="t">${fmtTime(m.created_at)}${relayTag}</span>`;
+    }
+    thread.appendChild(node);
+    if (!bulk) thread.scrollTop = thread.scrollHeight;
+  },
+
+  updateRelayTag(messageId, ok, error) {
+    const bubble = $("cs-thread").querySelector(`.cs-bubble[data-msg-id="${messageId}"]`);
+    if (!bubble) return;
+    let tag = bubble.querySelector(".cs-relaytag");
+    // 移除旧的重发按钮
+    const oldBtn = bubble.querySelector(".cs-resend-btn");
+    if (oldBtn) oldBtn.remove();
+    if (!tag) {
+      const t = bubble.querySelector(".t");
+      if (!t) return;
+      tag = document.createElement("span");
+      t.appendChild(tag);
+    }
+    tag.className = "cs-relaytag " + (ok ? "ok" : "fail");
+    tag.textContent = ok ? "已回投平台" : ("回投失败：" + (error || "未知原因"));
+    if (!ok) {
+      const btn = document.createElement("button");
+      btn.className = "cs-resend-btn";
+      btn.type = "button";
+      btn.textContent = "重发";
+      btn.title = "重新排队回投";
+      btn.onclick = () => csResend(messageId);
+      tag.parentNode.appendChild(btn);
+    }
+  },
+
+  setRelayWaiting(messageId) {
+    const el = $("cs-thread").querySelector(`.cs-bubble[data-msg-id="${messageId}"] .cs-relaytag`);
+    if (!el) return;
+    el.className = "cs-relaytag wait";
+    el.textContent = "等待工作台回投…";
+    el.title = "回复已排队，将由已登录该平台账号的工作台自动发到平台";
+  },
+
+  async accept(id) {
+    try { const c = await this.call(`/api/cs/agent/conversations/${id}/accept`, { method: "POST" });
+      this.renderHead(c); await this.refreshConvs(); toast("已接单", "ok");
+    } catch (e) { toast(e.message, "err"); }
+  },
+  async close(id) {
+    if (!await uiConfirm({ title: "结束会话", message: "结束后客户再次发消息会自动重新排队。", okText: "结束" })) return;
+    try { const c = await this.call(`/api/cs/agent/conversations/${id}/close`, { method: "POST" });
+      this.renderHead(c); await this.refreshConvs();
+    } catch (e) { toast(e.message, "err"); }
+  },
+
+  async release(id) {
+    if (!await uiConfirm({ title: "退回受理大厅", message: "退回后该会话重新进入排队队列，其他坐席可接单。", okText: "退回" })) return;
+    try { const c = await this.call(`/api/cs/agent/conversations/${id}/release`, { method: "POST" });
+      this.renderHead(c); await this.refreshConvs(); toast("已退回受理大厅", "ok");
+    } catch (e) { toast(e.message, "err"); }
+  },
+
+  async send() {
+    const inp = $("cs-input");
+    const text = (inp.value || "").trim();
+    if (!text || !this.current || this.busy) return;
+    this.busy = true;
+    try {
+      const r = await this.call(`/api/cs/agent/conversations/${this.current}/messages`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      inp.value = ""; inp.style.height = "auto";
+      this.appendMessage(r.message);
+      this.refreshConvs(true);
+    } catch (e) { toast(e.message, "err"); } finally { this.busy = false; }
+  },
+
+  async createLink() {
+    let url = "", token = "";
+    try {
+      const name = await uiPrompt({ title: "新建访客链接", hint: "可填写客户备注名（可不填）", placeholder: "客户备注名（可选）" });
+      if (name === null) return;
+      const r = await this.call("/api/cs/agent/links", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ customer_name: name || "" }),
+      });
+      url = r.url; token = r.token;
+    } catch (e) { toast(e.message, "err"); return; }
+    const modal = $("cs-modal");
+    modal.hidden = false;
+    modal.innerHTML = `<div class="cs-modal-box" onclick="event.stopPropagation()">
+      <h3>访客客服链接</h3>
+      <div class="hint">把链接发给客户，客户打开即可直接与客服对话；可放在菜单、自动回复或社交主页。</div>
+      <div class="cs-link-box">
+        <input id="cs-link-val" readonly value="${esc(url)}">
+        <button class="sm" type="button" onclick="csCopyLink()"><svg><use href="#i-copy"/></svg>复制</button>
+      </div>
+      <div class="hint">相对路径：<code>/chat/${esc(token)}</code>；云服务器部署后即为 https://你的域名/chat/${esc(token)}</div>
+      <div class="form-actions"><button class="ghost sm" type="button" onclick="csCloseModal()">完成</button></div>
+    </div>`;
+    modal.onclick = () => this.closeModal();
+  },
+  copyLink() {
+    const inp = $("cs-link-val");
+    inp.select();
+    try { navigator.clipboard.writeText(inp.value).then(() => toast("链接已复制", "ok")); }
+    catch (e) { try { document.execCommand("copy"); toast("链接已复制", "ok"); } catch (_) {} }
+  },
+
+  async openPicker(mode, id) {
+    let agents = [];
+    try { agents = await this.call("/api/cs/agent/agents"); } catch (e) { toast(e.message, "err"); return; }
+    this.agents = agents;
+    const isTransfer = mode === "transfer";
+    const modal = $("cs-modal");
+    modal.hidden = false;
+    modal.innerHTML = `<div class="cs-modal-box" onclick="event.stopPropagation()">
+      <h3>${isTransfer ? "转接给同事" : "邀请同事加入协作"}</h3>
+      <div class="hint">${isTransfer ? "转接后归属人变为对方，你仍可看到该会话。" : "邀请后双方都可在会话中回复客户。"}</div>
+      <div id="cs-picker-list">${agents.map(a => `
+        <div class="cs-agent-row">
+          <div class="grow"><b>${esc(a.display_name || a.username)}</b><div class="sub">@${esc(a.username)}${a.role === "admin" ? " · 管理员" : ""}</div></div>
+          <button class="${isTransfer ? "sm" : "ghost sm"}" type="button"
+            onclick="csPickAgent('${mode}',${id},${a.id})">${isTransfer ? "转接给他" : "邀请加入"}</button>
+        </div>`).join("") || '<div class="empty"><div class="empty-t">没有可选坐席</div></div>'}</div>
+      <div class="form-actions"><button class="ghost sm" type="button" onclick="csCloseModal()">取消</button></div>
+    </div>`;
+    modal.onclick = () => this.closeModal();
+  },
+  async pickAgent(mode, id, agentId) {
+    try {
+      const c = await this.call(`/api/cs/agent/conversations/${id}/${mode}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agent_id: agentId }),
+      });
+      this.closeModal();
+      this.renderHead(c); await this.refreshConvs();
+      toast(mode === "transfer" ? "已转接" : "已邀请", "ok");
+    } catch (e) { toast(e.message, "err"); }
+  },
+
+  async openAdmin() {
+    let rows = [], nodeInfo = null;
+    try { rows = await this.call("/api/cs/agent/admin/agents"); }
+    catch (e) { toast("需要管理员权限：" + e.message, "err"); return; }
+    try { nodeInfo = await this.call("/api/cs/agent/admin/node-token"); }
+    catch (e) { nodeInfo = null; /* 旧版服务器无此接口 */ }
+    const modal = $("cs-modal");
+    modal.hidden = false;
+    const renderRows = list => list.map(a => `
+      <div class="cs-agent-row">
+        <div class="grow"><b>${esc(a.display_name || a.username)}</b>
+          <div class="sub">@${esc(a.username)} · ${a.role === "admin" ? "管理员" : "坐席"} · ${a.enabled ? "已启用" : "已停用"}</div></div>
+        <button class="ghost sm" type="button" onclick="csAdminReset(${a.id},${JSON.stringify(a.username).replace(/"/g, "&quot;")})">重置密码</button>
+        <button class="ghost sm" type="button" onclick="csAdminToggle(${a.id},${!a.enabled})">${a.enabled ? "停用" : "启用"}</button>
+      </div>`).join("");
+    const q = nodeInfo && nodeInfo.queue && nodeInfo.queue.jobs;
+    const qText = q ? `排队 ${q.pending || 0} · 执行中 ${q.claimed || 0} · 已完成 ${q.done || 0} · 失败 ${q.failed || 0}` : "";
+    const envLock = nodeInfo && nodeInfo.source === "env";
+    const nodeCard = nodeInfo ? `
+      <div class="card" style="box-shadow:none;border:1px solid #eee;margin-bottom:14px">
+        <b>回投节点令牌</b>
+        <div class="sub" style="margin:4px 0 8px">工作台填写相同令牌后，客服回复会自动排队并由已登录平台账号的工作台发出。${qText ? `<br>当前队列：${esc(qText)}` : ""}</div>
+        ${envLock ? `<div class="sub">令牌由服务器环境变量 MMM_CS_NODE_TOKEN 提供（当前已设置），界面不可修改。</div>` : `
+        <label style="display:flex;gap:8px;align-items:center">令牌
+          <input id="cs-node-admin-token" type="text" placeholder="${nodeInfo.token ? "已设置（留空保存=清除）" : "至少 8 个字符，建议用随机串"}" value=""></label>
+        <div><button class="sm" type="button" onclick="csAdminSaveNodeToken()">保存令牌</button></div>`}
+      </div>` : "";
+    modal.innerHTML = `<div class="cs-modal-box" onclick="event.stopPropagation()">
+      <h3>坐席管理</h3>
+      ${nodeCard}
+      <div class="card" style="box-shadow:none;border:1px solid #eee;margin-bottom:14px">
+        <b>新建坐席</b>
+        <div class="stack" style="margin-top:8px">
+          <label style="display:flex;gap:8px;align-items:center">用户名 <input id="cs-na-user" placeholder="至少 2 个字符"></label>
+          <label style="display:flex;gap:8px;align-items:center">密码 <input id="cs-na-pass" type="password" placeholder="至少 6 位"></label>
+          <label style="display:flex;gap:8px;align-items:center">显示名 <input id="cs-na-name" placeholder="可选"></label>
+          <label style="display:flex;gap:8px;align-items:center"><input id="cs-na-admin" type="checkbox"> 管理员（可管理坐席）</label>
+          <div><button class="sm" type="button" onclick="csAdminCreate()">创建坐席</button></div>
+        </div>
+      </div>
+      <div id="cs-admin-list">${renderRows(rows)}</div>
+      <div class="form-actions"><button class="ghost sm" type="button" onclick="csCloseModal()">关闭</button></div>
+    </div>`;
+    modal.onclick = () => this.closeModal();
+    modal._renderRows = renderRows;
+  },
+  async adminSaveNodeToken() {
+    const token = ($("cs-node-admin-token")?.value || "").trim();
+    if (token && token.length < 8) { toast("节点令牌至少 8 个字符", "err"); return; }
+    if (!token && !await uiConfirm({ title: "清除节点令牌", message: "清除后所有工作台将无法认领回投任务，确定？", okText: "清除", danger: true })) return;
+    try {
+      await this.call("/api/cs/agent/admin/node-token", {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token }),
+      });
+      toast("节点令牌已保存", "ok");
+      this.openAdmin();
+    } catch (e) { toast(e.message, "err"); }
+  },
+  async adminCreate() {
+    const body = {
+      username: $("cs-na-user").value.trim(),
+      password: $("cs-na-pass").value,
+      display_name: $("cs-na-name").value.trim(),
+      role: $("cs-na-admin").checked ? "admin" : "agent",
+    };
+    try {
+      await this.call("/api/cs/agent/admin/agents", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      toast("已创建坐席", "ok");
+      const rows = await this.call("/api/cs/agent/admin/agents");
+      $("cs-admin-list").innerHTML = $("cs-modal")._renderRows(rows);
+      $("cs-na-user").value = ""; $("cs-na-pass").value = ""; $("cs-na-name").value = "";
+    } catch (e) { toast(e.message, "err"); }
+  },
+  async adminReset(id, username) {
+    const pwd = await uiPrompt({ title: `重置 @${username} 的密码`, placeholder: "新密码（至少 6 位）" });
+    if (pwd === null) return;
+    try {
+      await this.call(`/api/cs/agent/admin/agents/${id}/password`, {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: pwd }),
+      });
+      toast("密码已重置", "ok");
+    } catch (e) { toast(e.message, "err"); }
+  },
+  async adminToggle(id, enabled) {
+    try {
+      await this.call(`/api/cs/agent/admin/agents/${id}/enabled`, {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }),
+      });
+      const rows = await this.call("/api/cs/agent/admin/agents");
+      $("cs-admin-list").innerHTML = $("cs-modal")._renderRows(rows);
+    } catch (e) { toast(e.message, "err"); }
+  },
+
+  async takeover(payload) {
+    if (!this.authed) {
+      toast("请先在「客服接待」登录坐席账号", "err");
+      switchTab("cs", true);
+      return null;
+    }
+    try {
+      const c = await this.call("/api/cs/agent/takeover", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      return c;
+    } catch (e) { toast("转人工失败：" + e.message, "err"); return null; }
+  },
+
+  closeModal() { const m = $("cs-modal"); m.hidden = true; m.innerHTML = ""; },
+};
+
+function csLogin() {
+  const srv = ($("cs-server")?.value || "").trim();
+  // 切换服务器后旧登录态作废，避免拿 A 服务器的 token 打 B 服务器
+  const prev = CsPanel.base();
+  if (srv.replace(/\/+$/, "") !== prev) { CsPanel.token = ""; try { localStorage.removeItem("mmm_cs_token"); } catch (e) {} }
+  CsPanel.setBase(srv);
+  CsPanel.login(($("cs-login-user").value || "").trim(), $("cs-login-pass").value || "");
+}
+function csLogout() { CsPanel.logout(); }
+
+// ─── 本机回投节点配置（存的是本机后端，不是云客服服务器）───
+async function loadCsNodeConfig() {
+  try {
+    const c = await api("/api/cs/node-config");
+    const en = $("cs-node-enabled"), url = $("cs-node-url"), tok = $("cs-node-token");
+    if (en) en.checked = !!c.enabled;
+    if (url && !url.value) url.value = c.url || ($("cs-server")?.value || "");
+    if (tok) tok.placeholder = c.has_token ? "已保存（留空保存则不修改）" : "在服务器「坐席管理 → 回投节点令牌」中设置";
+    csNodeRenderStatus(c.enabled, c.status || {});
+    csLanRender(c);
+  } catch (e) { /* 旧后端无此接口时静默 */ }
+}
+function csLanRender(c) {
+  const en = $("cs-lan-enabled"), port = $("cs-lan-port"), addr = $("cs-lan-addr");
+  if (!en || !c) return;
+  en.checked = !!c.lan_enabled;
+  if (port && !port.value) port.value = c.lan_port || 8080;
+  if (addr) {
+    const p = c.lan_port || 8080;
+    addr.textContent = c.lan_ip
+      ? `本机局域网地址：http://${c.lan_ip}:${p}（其他电脑在客服登录卡填此地址）`
+      : "未能自动探测本机局域网 IP，可在 Windows 网络设置中查看";
+  }
+}
+async function csLanSave() {
+  const lan_enabled = !!$("cs-lan-enabled")?.checked;
+  let lan_port = parseInt(($("cs-lan-port")?.value || "").trim(), 10);
+  if (!lan_port) lan_port = 8080;
+  if (lan_port < 1 || lan_port > 65535) { toast("端口需在 1-65535 之间", "err"); return; }
+  try {
+    const r = await api("/api/cs/node-config", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lan_enabled, lan_port }),
+    });
+    csLanRender(r.config || {});
+    toast("已保存，重启程序后局域网服务生效", "ok");
+  } catch (e) { toast("保存失败：" + e.message, "err"); }
+}
+function csNodeRenderStatus(enabled, st) {
+  const el = $("cs-node-status");
+  if (!el) return;
+  if (!enabled) { el.textContent = "未启用"; el.style.color = ""; return; }
+  if (st && st.connected === false) {
+    el.textContent = "连接异常：" + (st.error || "未知错误");
+    el.style.color = "#c0392b";
+  } else if (st && st.checked_at) {
+    const t = new Date(st.checked_at).toLocaleTimeString();
+    el.textContent = "已连接，最近轮询 " + t + (st.executed_count ? `，累计回投 ${st.executed_count} 条` : "");
+    el.style.color = "#1e8e3e";
+  } else {
+    el.textContent = "已启用（等待下一次轮询）";
+    el.style.color = "";
+  }
+}
+async function csNodeSave(testConn) {
+  const enabled = $("cs-node-enabled").checked;
+  const url = ($("cs-node-url")?.value || "").trim();
+  const token = ($("cs-node-token")?.value || "").trim();
+  if (enabled && !url) { toast("请填写客服服务器地址", "err"); return; }
+  if (enabled && testConn && !token) {
+    const c = await api("/api/cs/node-config").catch(() => null);
+    if (!c || !c.has_token) { toast("请填写节点令牌", "err"); return; }
+  }
+  try {
+    const r = await api("/api/cs/node-config", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled, url, token }),
+    });
+    $("cs-node-token").value = "";
+    csNodeRenderStatus(enabled, (r.config && r.config.status) || {});
+    if (r.probe) {
+      if (r.probe.ok) toast("已保存，节点连接正常 ✓", "ok");
+      else toast("已保存，但连接测试失败：" + r.probe.error, "err", 8000);
+    } else {
+      toast("已保存", "ok");
+    }
+  } catch (e) { toast("保存失败：" + e.message, "err"); }
+}
+function csSetFilter(f) { CsPanel.setFilter(f); }
+function csSelect(id) { CsPanel.select(id); }
+function csBack() { CsPanel.backToList(); }
+function csAccept(id) { CsPanel.accept(id); }
+function csClose(id) { CsPanel.close(id); }
+function csRelease(id) { CsPanel.release(id); }
+function csSend() { CsPanel.send(); }
+function csCreateLink() { CsPanel.createLink(); }
+function csCopyLink() { CsPanel.copyLink(); }
+function csOpenPicker(mode, id) { CsPanel.openPicker(mode, id); }
+function csPickAgent(mode, id, agentId) { CsPanel.pickAgent(mode, id, agentId); }
+function csOpenAdmin() { CsPanel.openAdmin(); }
+function csCloseModal() { CsPanel.closeModal(); }
+async function csAdminCreate() { return CsPanel.adminCreate(); }
+async function csAdminSaveNodeToken() { return CsPanel.adminSaveNodeToken(); }
+async function csAdminReset(id, username) { return CsPanel.adminReset(id, username); }
+async function csAdminToggle(id, enabled) { return CsPanel.adminToggle(id, enabled); }
+
+function csApplyFilters() {
+  const src = $("cs-source-filter")?.value || "";
+  const unread = !!$("cs-unread-only")?.checked;
+  CsPanel.sourceFilter = src;
+  CsPanel.unreadOnly = unread;
+  CsPanel.refreshConvs();
+}
+
+async function csResend(messageId) {
+  if (!await uiConfirm({ title: "重新回投", message: "将把这条回复重新排队，由工作台再次发送到平台。同一回复不会重复发布。", okText: "重发" })) return;
+  try {
+    await CsPanel.call(`/api/cs/agent/messages/${messageId}/resend`, { method: "POST" });
+    toast("已重新排队回投", "ok");
+    // 重发后消息状态会通过 SSE relay_queued 事件更新为等待中
+  } catch (e) { toast(e.message, "err"); }
+}
+
+// ─── 快捷回复 ───
+async function csOpenQuickReplies() {
+  if (!CsPanel.authed) { toast("请先登录坐席", "err"); return; }
+  try { CsPanel.quickReplies = await CsPanel.call("/api/cs/agent/quick-replies"); }
+  catch (e) { toast("加载快捷回复失败：" + e.message, "err"); CsPanel.quickReplies = []; }
+  const modal = $("cs-modal");
+  modal.hidden = false;
+  modal.innerHTML = `<div class="cs-modal-box" onclick="event.stopPropagation()">
+    <h3>快捷回复</h3>
+    <div class="hint">点击模板填入输入框；可新建、编辑、删除个人模板。</div>
+    <div class="card" style="box-shadow:none;border:1px solid #eee;margin-bottom:14px">
+      <b>新建模板</b>
+      <div class="stack" style="margin-top:8px">
+        <label>标题（可选）<input id="cs-qr-title" placeholder="如：问候语" maxlength="50"></label>
+        <label>回复内容<textarea id="cs-qr-text" rows="3" placeholder="输入常用回复内容" maxlength="2000"></textarea></label>
+        <div><button class="sm" type="button" onclick="csQuickCreate()">添加</button></div>
+      </div>
+    </div>
+    <div id="cs-qr-list">${csRenderQuickList()}</div>
+    <div class="form-actions"><button class="ghost sm" type="button" onclick="csCloseModal()">关闭</button></div>
+  </div>`;
+  modal.onclick = () => CsPanel.closeModal();
+}
+
+function csRenderQuickList() {
+  if (!CsPanel.quickReplies.length)
+    return '<div class="empty"><div class="empty-t">暂无快捷回复</div></div>';
+  return CsPanel.quickReplies.map(q => `
+    <div class="cs-agent-row">
+      <div class="grow"><b>${esc(q.title)}</b><div class="sub">${esc(q.text)}</div></div>
+      <button class="ghost sm" type="button" onclick="csQuickUse('${q.id}')">使用</button>
+      <button class="ghost sm" type="button" onclick="csQuickEdit('${q.id}')">编辑</button>
+      <button class="ghost sm danger" type="button" onclick="csQuickDelete('${q.id}')">删除</button>
+    </div>`).join("");
+}
+
+async function csQuickCreate() {
+  const title = ($("cs-qr-title")?.value || "").trim();
+  const text = ($("cs-qr-text")?.value || "").trim();
+  if (!text) { toast("内容不能为空", "err"); return; }
+  try {
+    const qr = await CsPanel.call("/api/cs/agent/quick-replies", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, text }),
+    });
+    CsPanel.quickReplies.push(qr);
+    $("cs-qr-list").innerHTML = csRenderQuickList();
+    $("cs-qr-title").value = ""; $("cs-qr-text").value = "";
+    toast("已添加", "ok");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function csQuickUse(qrId) {
+  const qr = CsPanel.quickReplies.find(q => q.id === qrId);
+  if (!qr) return;
+  const inp = $("cs-input");
+  inp.value = qr.text;
+  inp.focus();
+  CsPanel.closeModal();
+}
+
+async function csQuickEdit(qrId) {
+  const qr = CsPanel.quickReplies.find(q => q.id === qrId);
+  if (!qr) return;
+  const title = await uiPrompt({ title: "编辑标题", value: qr.title });
+  if (title === null) return;
+  const text = await uiPrompt({ title: "编辑回复内容", value: qr.text });
+  if (text === null) return;
+  if (!text.trim()) { toast("内容不能为空", "err"); return; }
+  try {
+    const updated = await CsPanel.call(`/api/cs/agent/quick-replies/${qrId}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, text }),
+    });
+    const idx = CsPanel.quickReplies.findIndex(q => q.id === qrId);
+    if (idx >= 0) CsPanel.quickReplies[idx] = updated;
+    $("cs-qr-list").innerHTML = csRenderQuickList();
+    toast("已保存", "ok");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function csQuickDelete(qrId) {
+  if (!await uiConfirm({ title: "删除快捷回复", message: "确定删除该模板？", okText: "删除", danger: true })) return;
+  try {
+    await CsPanel.call(`/api/cs/agent/quick-replies/${qrId}`, { method: "DELETE" });
+    CsPanel.quickReplies = CsPanel.quickReplies.filter(q => q.id !== qrId);
+    $("cs-qr-list").innerHTML = csRenderQuickList();
+    toast("已删除", "ok");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+// 平台私信「转人工」
+async function csTakeoverDm() {
+  if (!HUB_ACC || !DM_CONV) { toast("请先选择一条私信会话", "err"); return; }
+  if (PLATFORM === "shipinhao") { toast("视频号暂不支持私信转人工", "err"); return; }
+  const c = DM_CONVS.find(x => x.conv_id === DM_CONV) || {};
+  const acc = ACCOUNTS.find(a => String(a.id) === String(HUB_ACC)) || {};
+  const conv = await CsPanel.takeover({
+    source: PLATFORM + "_dm", account_id: +HUB_ACC, account_key: acc.sec_uid || "",
+    thread_key: DM_CONV,
+    customer_name: c.peer_nickname || "", first_message: c.last_text || "",
+  });
+  if (conv) {
+    toast("已转入客服接待，后续回复将自动回投私信", "ok");
+    CsPanel.setFilter("");
+    await CsPanel.refreshConvs();
+    switchTab("cs", true);
+    csSelect(conv.id);
+  }
+}
+
+// 平台评论「转人工」（按钮挂在评论监控表格行内）
+async function csTakeoverComment(btn) {
+  const aweme = btn.dataset.aweme || "", cid = btn.dataset.cid || "";
+  if (!aweme || !cid) { toast("评论定位信息缺失，无法转人工", "err"); return; }
+  const wid = btn.dataset.watch ? +btn.dataset.watch : 0;
+  const watch = wid && (typeof watchById === "function") ? watchById(wid) : null;
+  const watchPlatform = watch?.platform || PLATFORM;
+  let accountId = watch && watch.account_id ? +watch.account_id : 0;
+  let acc = accountId ? (ACCOUNTS.find(a => a.id === accountId) || {}) : {};
+  if (!accountId) {
+    const fallback = ACCOUNTS.find(a => String(a.id) === String(HUB_ACC)
+      && a.platform === watchPlatform && a.status !== "invalid"
+      && (a.sec_uid || "").trim()) || null;
+    if (fallback) { accountId = fallback.id; acc = fallback; }
+  }
+  const oldText = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = `${ic("i-loading")}转人工中…`;
+  try {
+    const conv = await CsPanel.takeover({
+      source: watchPlatform + "_comment", account_id: accountId, account_key: acc.sec_uid || "",
+      thread_key: aweme + ":" + cid,
+      customer_name: btn.dataset.nick || "", first_message: btn.dataset.text || "",
+    });
+    if (conv) {
+      btn.innerHTML = `${ic("i-check")}已受理`;
+      btn.classList.add("on");
+      btn.classList.remove("ghost");
+      btn.title = "已转入客服接待";
+      btn.disabled = true;
+      return;
+    }
+  } catch (e) { /* takeover 内部已 toast */ }
+  btn.disabled = false;
+  btn.innerHTML = oldText;
+}
+
+// 切到客服页时刷新数据
+const _csOrigSwitchTab = switchTab;
+window.switchTab = function (name, pushHistory) {
+  _csOrigSwitchTab(name, pushHistory);
+  if (name === "cs" && CsPanel.authed) { CsPanel.refreshCounts(); CsPanel.refreshConvs(); }
+  if (name === "cs-settings") loadCsNodeConfig();
+  const licBanner = document.getElementById('license-banner');
+  if (licBanner && licBanner.dataset.needsShow === '1') {
+    licBanner.hidden = (name !== 'overview' && name !== 'accounts');
+  }
+};
+
+CsPanel.init();
+

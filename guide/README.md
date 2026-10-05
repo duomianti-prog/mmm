@@ -1,4 +1,4 @@
-# CreatorHub 公开使用指南
+# mmm 公开使用指南
 
 公开用户文档源文件在 `guide/`，与被 Git 忽略的内部 `docs/` 分开。
 

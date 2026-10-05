@@ -14,5 +14,5 @@ if [ -x ".venv/bin/python" ]; then
     exec .venv/bin/python creatorhub.py "$@"
 fi
 
-echo "[CreatorHub] 需要先安装 Python 3.10+。" >&2
+echo "[mmm] 需要先安装 Python 3.10+。" >&2
 exit 1

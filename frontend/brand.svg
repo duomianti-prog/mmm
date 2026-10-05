@@ -1,3 +1,3 @@
-<!-- Original CreatorHub mark from https://3441293738.github.io/creatorhub/.
-     Keep separate from the Lucide search icon and the replaceable UI icon set. -->
-<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><circle cx="11" cy="11" r="2.5"/></svg>
+<!-- mmm lettermark: dark rounded tile with bold white "mmm".
+     Used as the canonical brand glyph (sidebar, favicon, icon build). -->
+<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="1.2" y="1.2" width="21.6" height="21.6" rx="5.6" fill="#1d1d1f" stroke="#ffffff" stroke-opacity="0.22" stroke-width="0.8"/><text x="12" y="15.6" text-anchor="middle" textLength="16.4" lengthAdjust="spacingAndGlyphs" font-family="Arial, Helvetica, sans-serif" font-size="8.6" font-weight="800" fill="#ffffff" letter-spacing="-0.6">mmm</text></svg>

@@ -31,7 +31,7 @@ export default function Updates({ state, disabled, act, Modal, Button, Icon, sho
     {!showSettings && update.notification && <section className="update-banner" aria-label="版本更新提醒">
       <Icon name={ready ? "shield-check" : "download"} size={22} />
       <div className="update-banner-copy">
-        <b role="status">{ready ? `CreatorHub ${update.version} 已准备好` : downloading ? "正在下载新版，当前任务继续运行" : installing ? "正在安装新版" : `发现 CreatorHub ${update.version}`}</b>
+        <b role="status">{ready ? `mmm ${update.version} 已准备好` : downloading ? "正在下载新版，当前任务继续运行" : installing ? "正在安装新版" : `发现 mmm ${update.version}`}</b>
         <p>{ready ? "方便时安装并重启，账号与配置会保留。" : downloading ? `${megabytes(update.downloaded_bytes)} / ${megabytes(downloadSize)} · 支持断点续传` : update.status === "available" ? "可先查看更新说明，再决定是否更新。" : update.message}</p>
         {downloading && <progress aria-label="安装包下载进度" max="100" value={progress} />}
         <div className="update-actions">
@@ -43,7 +43,7 @@ export default function Updates({ state, disabled, act, Modal, Button, Icon, sho
     </section>}
     {showSettings && <section className="settings-group desktop-updates" aria-labelledby="updates-title">
     <h2 id="updates-title">版本与更新</h2>
-    <div className="setting-row"><div><b>CreatorHub {state.version}</b><span>下载不中断任务，安装前再次确认。</span></div><Button disabled={disabled || busy || ready} icon={checking ? "loader-circle" : "refresh-cw"} onClick={() => act("check_updates")}>{checking ? "正在检查…" : "检查更新"}</Button></div>
+    <div className="setting-row"><div><b>mmm {state.version}</b><span>下载不中断任务，安装前再次确认。</span></div><Button disabled={disabled || busy || ready} icon={checking ? "loader-circle" : "refresh-cw"} onClick={() => act("check_updates")}>{checking ? "正在检查…" : "检查更新"}</Button></div>
     <div className="setting-row"><label htmlFor="auto-check-updates"><b>自动检查新版本</b><span>安装版启动后在后台检查，每天最多一次。只提醒，不自动下载。</span></label><input id="auto-check-updates" className="switch" type="checkbox" role="switch" checked={update.auto_check !== false} disabled={disabled} onChange={e => act("update_preferences", { auto_check: e.target.checked })} /></div>
     <div className={`update-status ${["error", "download_error", "install_error"].includes(update.status) ? "update-error" : ""}`} role="status" aria-live="polite" aria-busy={checking}>
       <span>{update.message}</span>{update.checked_at && <small>上次检查：{new Date(update.checked_at * 1000).toLocaleString("zh-CN", { hour12: false })}</small>}
@@ -70,7 +70,7 @@ export default function Updates({ state, disabled, act, Modal, Button, Icon, sho
     {downloadable && !update.verified_download && <p className="update-help">此版本尚未提供完整的校验信息，一键更新将在发布信息补齐后开放。</p>}
     {ready && !state.update_install_supported && <p className="update-help">一键安装在打包后的 Windows 桌面客户端中使用；源码预览不执行安装。</p>}
     </section>}
-    <Modal open={!!dialog} onOpenChange={value => { if (!value) close(); }} title={dialog === "install" ? "安装新版并重启？" : dialog === "manual" ? "下载前，请留意" : `CreatorHub ${update.version || ""}`} description={dialog === "install" ? "先备份，再更新程序；账号资料和媒体文件原位保留。" : dialog === "manual" ? "下载由默认浏览器处理，当前任务不会被中断。" : "GitHub 正式版更新说明"}>
+    <Modal open={!!dialog} onOpenChange={value => { if (!value) close(); }} title={dialog === "install" ? "安装新版并重启？" : dialog === "manual" ? "下载前，请留意" : `mmm ${update.version || ""}`} description={dialog === "install" ? "先备份，再更新程序；账号资料和媒体文件原位保留。" : dialog === "manual" ? "下载由默认浏览器处理，当前任务不会被中断。" : "GitHub 正式版更新说明"}>
       {dialog === "install" ? <div className="update-detail">
         <div className="update-warning"><Icon name="triangle-alert" /><p>{state.can_stop ? "本地服务正在运行。继续会停止服务，并中断正在进行的采集、发布等任务。" : "启动中心将退出以替换程序文件，安装完成后重新打开。"}</p></div>
         <ol className="update-steps"><li>再次校验安装包，停止服务。</li><li>备份配置与数据库，保留账号和媒体。</li><li>安装新版并重新打开启动中心，不自动重放任务。</li></ol>

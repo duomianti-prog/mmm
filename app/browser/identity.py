@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+from ..platforms import registry as platforms
+
 # 真实机型 User-Agent 池(Windows/Mac Chrome,版本接近主流)。
 # 一号选定一条后固定;切勿频繁变更。
 UA_POOL: List[str] = [
@@ -98,6 +100,8 @@ class Identity:
     browser_runtime_id: str = ""
     # 扫码页已经观察到的当前用户资料，仅在本次登录内存中传递；不参与指纹签名。
     observed_login_profile: dict = field(default_factory=dict, repr=False)
+    # 平台要求强制上下文 locale/时区(TikTok):即使 native 画像也不跟随宿主系统。
+    pin_context_locale: bool = False
 
     @property
     def key(self):
@@ -122,6 +126,7 @@ class Identity:
         pdir = acc.profile_dir or str(Path(profiles_root) / f"acc_{acc.id}")
         bridge = tuple(s for s in (getattr(acc, "storage_state", ""),
                                    getattr(acc, "creator_storage_state", "")) if s)
+        platform_spec = platforms.get(getattr(acc, "platform", ""))
         return cls(
             account_id=acc.id, profile_dir=pdir,
             platform=getattr(acc, "platform", "") or "",
@@ -165,6 +170,8 @@ class Identity:
             geo_lat=getattr(acc, "geo_lat", 0.0) or 0.0,
             geo_lon=getattr(acc, "geo_lon", 0.0) or 0.0,
             bridge_states=bridge,
+            pin_context_locale=bool(
+                platform_spec and platform_spec.pin_context_locale),
         )
 
 

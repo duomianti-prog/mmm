@@ -68,6 +68,9 @@ _PUBLISH_BTN = [
 ]
 # 发布成功判据(页面跳转/出现提示)
 _OK_TEXTS = ["发表成功", "发布成功", "提交成功"]
+# 发布失败/受阻判据(toast 文案;命中即带证据返回,不空等超时)
+_FAIL_TEXTS = ["发表失败", "发布失败", "提交失败", "操作过于频繁", "操作频繁",
+               "审核未通过", "包含违规", "请先完成", "请补充封面"]
 
 # ── 位置 POI(可选;选择器需真号校准,任何一步失败都跳过、不阻塞发布)──
 _POI_TRIGGER = [
@@ -84,21 +87,6 @@ _POI_RESULT = [
     '[class*="poi"] [class*="item"]', '[class*="position"] li',
     '.dropdown-item', '[class*="option"]',
 ]
-
-
-async def _fill_first(page, selectors, text, timeout=2500) -> bool:
-    for sel in selectors:
-        try:
-            el = page.locator(sel).first
-            await el.click(timeout=timeout)
-            try:
-                await el.fill(text, timeout=timeout)
-            except Exception:
-                await page.keyboard.type(text, delay=30)   # contenteditable 不支持 fill
-            return True
-        except Exception:
-            continue
-    return False
 
 
 async def _click_first(page, selectors, timeout=3000) -> bool:
@@ -222,7 +210,7 @@ async def publish_channels(mgr: BrowserManager, identity: Identity,
         # 视频号发布入口就是 create 页;图文/视频靠点左侧导航切换(finderNewLifeCreateg 会 302 回 create)
         await page.goto(CREATE_URL_VIDEO, wait_until="domcontentloaded", timeout=40000)
         await page.wait_for_timeout(4000)
-        if "login.html" in page.url or page.url.rstrip("/").endswith("/login"):
+        if "/login" in page.url or "login.html" in page.url:
             return False, "", f"logged_out:视频号助手未登录(落到 {page.url})"
 
         # 图文:点左侧「图文」→ 图文列表页 → 点「发表图文」→ 图文发布表单
@@ -262,24 +250,30 @@ async def publish_channels(mgr: BrowserManager, identity: Identity,
             diag = await _collect_diag(page, "upload-failed")
             return False, "", (f"上传失败(未找到可用上传入口/文件选择器)。DOM诊断: {diag}")
 
-        # 等待转码/上传(视频较久)
+        # 等待转码/上传(视频较久);会话可能在上传期间失效,复检登录落点
         await page.wait_for_timeout(8000 if media_type == "video" else 4000)
+        if "/login" in page.url or "login.html" in page.url:
+            return False, "", f"logged_out:上传后登录态失效(落到 {page.url}),请重新登录"
 
         if title:
             el, _tf = await _find_in_frames(page, _SHORT_TITLE_SEL)
             if el is not None:
                 try:
                     await el.fill(title[:16])
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning("[channels_publish] 短标题填写失败(不阻塞发布): %r", e)
+            else:
+                log.warning("[channels_publish] 未找到短标题输入框(_SHORT_TITLE_SEL 需校准)")
         if body:
             el, _df = await _find_in_frames(page, _DESC_SEL)
             if el is not None:
                 try:
                     await el.click()
                     await page.keyboard.type(body, delay=20)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning("[channels_publish] 描述填写失败(不阻塞发布): %r", e)
+            else:
+                log.warning("[channels_publish] 未找到描述编辑器(_DESC_SEL 需校准)")
         # 位置 POI(可选,best-effort)
         await _set_location(page, location)
         await page.wait_for_timeout(1000)
@@ -295,6 +289,7 @@ async def publish_channels(mgr: BrowserManager, identity: Identity,
 
         # 等成功:视频号发表后会**跳到「图文/视频管理」列表页**(URL 含 PostList),
         # 或短暂弹「发表成功」toast。以跳列表页为主判据(实测 finderNewLifePostList)。
+        fail_text = ""
         for _ in range(int(timeout_seconds / 2)):
             url_l = page.url.lower()
             # finderNewLifePostList / post/list 等管理列表页 -> 发表成功后的落点
@@ -304,16 +299,28 @@ async def publish_channels(mgr: BrowserManager, identity: Identity,
             # toast 可能在主页面或 micro/content iframe 里
             for fr in page.frames:
                 try:
-                    if any([await fr.get_by_text(t, exact=False).count() for t in _OK_TEXTS]):
+                    if any([await fr.get_by_text(t, exact=False).count()
+                            for t in _OK_TEXTS]):
                         ok = True
+                        break
+                    for t in _FAIL_TEXTS:
+                        if await fr.get_by_text(t, exact=False).count():
+                            fail_text = t
+                            break
+                    if fail_text:
                         break
                 except Exception:
                     pass
             if ok:
                 break
+            if fail_text:
+                diag = await _collect_diag(page, "publish-failed-toast")
+                error = (f"视频号提示「{fail_text}」,发表未成功(多为封面/审核/频控要求)。"
+                         f"当前页: {page.url}; DOM诊断: {diag}")
+                break
             await page.wait_for_timeout(2000)
         result_url = page.url if ok else ""
-        if not ok:
+        if not ok and not fail_text:
             diag = await _collect_diag(page, "no-success")
             error = ("已点发表但未确认成功(视频号可能要求封面/实名/过脸验证,请到助手确认)。"
                      f"当前页: {page.url}; DOM诊断: {diag}")

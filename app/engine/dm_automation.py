@@ -429,6 +429,7 @@ class XhsDmAutomation:
                 if hist_error:
                     continue
                 incoming_ids: list[str] = []
+                fresh_in: list[tuple[str, str, int]] = []
                 with get_session() as session:
                     for msg in parsed.get("messages", []):
                         msg_id = str(msg.get("server_msg_id") or "")
@@ -460,6 +461,7 @@ class XhsDmAutomation:
                                  and not bool(msg.get("group_chat")))
                         if fresh:
                             incoming_ids.append(msg_id)
+                            fresh_in.append((msg_id, row.text, row.create_time or 0))
                             events.append({
                                 "type": "message", "account_id": account_id,
                                 "conv_id": str(item["conv_id"]),
@@ -480,6 +482,26 @@ class XhsDmAutomation:
                     if outcome in {"queued", "draft"}:
                         events.append({"type": "auto_reply", "account_id": account_id,
                                        "conv_id": item["conv_id"], "state": outcome})
+                # 客服统一入站总线：小红书新私信按账号接待开关自动建档/镜像，
+                # 批次按服务端时间升序落库并持久化游标（断线/重启后补拉去重）
+                if fresh_in:
+                    try:
+                        from ..cs import inbound as cs_inbound
+                        cs_inbound.ingest_dm_batch(
+                            platform="xhs", account_id=account_id,
+                            account_key=account.sec_uid or account.uid or "",
+                            rows=[{
+                                "thread_key": str(item["conv_id"]),
+                                "text": text or "",
+                                "platform_msg_id": "xhs:" + msg_id,
+                                "peer_uid": str(item.get("peer_uid") or ""),
+                                "peer_nickname": str(item.get("peer_nickname") or ""),
+                                "peer_avatar": str(item.get("peer_avatar") or ""),
+                                "msg_ts": create_ts,
+                            } for msg_id, text, create_ts in fresh_in],
+                            cursor=str(new_max))
+                    except Exception as e:
+                        print(f"[xhs-dm] 客服联动失败（不影响私信）: {e!r}")
                 with get_session() as session:
                     stored_conv = session.exec(select(DmConversation).where(
                         DmConversation.account_id == account_id,

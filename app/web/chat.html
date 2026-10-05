@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<title>在线客服 · mmm</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+:root{--brand:#1d1d1f;--brand2:#3a3a3d;--bg:#f4f4f6;--bubble:#fff;--mine:#1d1d1f;--mine-text:#fff;
+--text:#1d1d1f;--muted:#8e8e93;--sys:#b5b5bb;--line:#e5e5ea;--accent:#0a84ff}
+html,body{height:100%}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei UI",sans-serif;
+background:var(--bg);color:var(--text);display:flex;flex-direction:column;overflow:hidden}
+header{background:var(--brand);color:#fff;padding:calc(10px + env(safe-area-inset-top)) 14px 10px;
+display:flex;align-items:center;gap:10px;flex:0 0 auto}
+.logo{width:30px;height:30px;border-radius:8px;background:#fff;display:flex;align-items:center;
+justify-content:center;flex:none}
+.logo svg{width:30px;height:30px}
+.htext{min-width:0;flex:1}
+.htext .name{font-size:15px;font-weight:700;line-height:1.25}
+.htext .status{font-size:12px;color:#c7c7cc;line-height:1.4}
+.htext .status.online{color:#30d158}
+main{flex:1 1 auto;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:14px 12px 8px}
+.day{text-align:center;color:var(--muted);font-size:12px;margin:6px 0 12px}
+.row{display:flex;margin-bottom:12px;align-items:flex-end;gap:7px}
+.row.mine{flex-direction:row-reverse}
+.avatar{width:32px;height:32px;border-radius:50%;flex:none;display:flex;align-items:center;
+justify-content:center;font-size:13px;font-weight:700;color:#fff;background:var(--brand2)}
+.row.mine .avatar{background:var(--brand)}
+.bubble{max-width:76%;padding:9px 12px;border-radius:16px;font-size:15px;line-height:1.55;
+word-break:break-word;white-space:pre-wrap;background:var(--bubble);
+box-shadow:0 1px 2px rgba(0,0,0,.06);position:relative}
+.row.mine .bubble{background:var(--mine);color:var(--mine-text)}
+.row.mine:first-child .bubble{border-bottom-right-radius:6px}
+.row:not(.mine) .bubble{border-bottom-left-radius:6px}
+.meta{font-size:11px;color:var(--muted);margin:1px 3px 0}
+.row.mine .meta{text-align:right}
+.sysline{text-align:center;margin:10px auto;max-width:86%}
+.sysline span{display:inline-block;background:rgba(120,120,128,.12);color:#6d6d74;
+font-size:12px;padding:4px 12px;border-radius:999px;line-height:1.5}
+.bubble .failtag{display:block;color:#ff453a;font-size:11px;margin-top:4px}
+.send-state{font-size:11px;margin-left:4px;color:#8e8e93}
+.send-state[data-state="sending"]{color:#ff9500}
+footer{flex:0 0 auto;background:#fff;border-top:1px solid var(--line);
+padding:8px 10px calc(8px + env(safe-area-inset-bottom));display:flex;gap:8px;align-items:flex-end}
+textarea{flex:1;border:0;outline:0;resize:none;font:inherit;font-size:15px;line-height:1.4;
+max-height:96px;padding:8px 12px;background:#f2f2f7;border-radius:18px;color:var(--text)}
+button.send{flex:none;border:0;border-radius:18px;background:var(--brand);color:#fff;
+font-size:15px;font-weight:600;padding:8px 18px;cursor:pointer}
+button.send:disabled{opacity:.4}
+.nickbar{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);
+padding:6px 14px 0;background:var(--bg)}
+.nickbar input{border:0;background:transparent;border-bottom:1px solid var(--line);
+font:inherit;font-size:12px;color:var(--text);outline:0;width:120px;padding:1px 2px}
+.unavailable{margin:auto;text-align:center;padding:32px;display:none}
+.unavailable .big{font-size:22px;font-weight:800;letter-spacing:1px;margin-bottom:14px}
+.unavailable p{color:var(--muted);font-size:14px;line-height:1.8}
+.typing{display:none;color:var(--muted);font-size:12px;padding:0 14px 6px}
+@media(min-width:560px){
+ body{max-width:520px;margin:0 auto;box-shadow:0 0 30px rgba(0,0,0,.08)}
+ header{border-radius:0}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo" aria-hidden="true">
+    <svg viewBox="0 0 32 32"><rect x="1" y="1" width="30" height="30" rx="8" fill="#1d1d1f"/>
+    <text x="16" y="22.5" text-anchor="middle" font-family="Arial,sans-serif" font-size="12.5"
+    font-weight="800" fill="#fff">mmm</text></svg>
+  </div>
+  <div class="htext">
+    <div class="name">mmm 在线客服</div>
+    <div class="status" id="status">正在连接…</div>
+  </div>
+</header>
+<main id="chat">
+  <div class="day">客服已就绪，请描述您的问题</div>
+</main>
+<div class="typing" id="typing">客服正在输入…</div>
+<footer>
+  <textarea id="input" rows="1" placeholder="请输入消息…" maxlength="4000"></textarea>
+  <button class="send" id="send">发送</button>
+</footer>
+<div class="unavailable" id="unavailable">
+  <div class="big">mmm</div>
+  <p>在线客服暂不可用<br>请稍后再试，或通过其他方式联系我们</p>
+</div>
+<script>
+(function(){
+  "use strict";
+  var token = decodeURIComponent(location.pathname.replace(/^\/chat\//, "").replace(/\/+$/, ""));
+  var chat = document.getElementById("chat");
+  var input = document.getElementById("input");
+  var sendBtn = document.getElementById("send");
+  var statusEl = document.getElementById("status");
+  var unavail = document.getElementById("unavailable");
+  var typingEl = document.getElementById("typing");
+
+  var lastId = 0, closed = false;
+  var es = null, esRetry = 0, esTimer = null;
+  var pollTimer = null;
+  var online = typeof navigator !== "undefined" ? navigator.onLine : true;
+
+  // ── 发送队列（带幂等键 + 重试退避）──
+  var sendQueue = [];          // {idemKey, text, el, status, retry}
+  var sending = false;
+  var MAX_RETRY = 5;
+
+  function uuid(){
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return "g-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+  }
+
+  function esc(s){
+    return String(s==null?"":s).replace(/[&<>"']/g, function(c){
+      return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];
+    });
+  }
+  function hm(ts){
+    var d = new Date((ts||0)*1000);
+    return ("0"+d.getHours()).slice(-2)+":"+("0"+d.getMinutes()).slice(-2);
+  }
+  function scrollBottom(){ chat.scrollTop = chat.scrollHeight; }
+
+  function addSys(text){
+    var d = document.createElement("div");
+    d.className = "sysline";
+    d.innerHTML = "<span>"+esc(text)+"</span>";
+    chat.appendChild(d); scrollBottom();
+  }
+
+  function statusText(){
+    if (!online) return "网络已断开";
+    if (es && es.readyState === EventSource.OPEN) return closed ? "会话已结束（发消息将重新接入）" : "客服在线";
+    return "正在重连…";
+  }
+  function refreshStatus(){
+    var ok = online && es && es.readyState === EventSource.OPEN;
+    statusEl.textContent = statusText();
+    statusEl.className = "status" + (ok ? " online" : "");
+  }
+
+  function setClosed(c){
+    closed = c;
+    refreshStatus();
+  }
+
+  function addMessage(m, opts){
+    opts = opts || {};
+    // 服务端消息按 id 去重
+    if (m.id && m.id <= lastId) return null;
+    if (m.id) lastId = Math.max(lastId, m.id);
+    if (m.sender_kind === "system"){ addSys(m.text); return null; }
+    var row = document.createElement("div");
+    var mine = m.sender_kind === "customer";
+    row.className = "row" + (mine ? " mine" : "");
+    var initial = mine ? "我" : (m.sender_name ? m.sender_name.charAt(0) : "客");
+    var fail = "";
+    if (mine && m.relayed === false) fail = '<span class="failtag">平台未送达，客服可能在工作台手动回复</span>';
+    row.innerHTML =
+      '<div class="avatar">'+esc(mine ? "我" : initial)+'</div>' +
+      '<div><div class="bubble">'+esc(m.text)+fail+'</div>' +
+      '<div class="meta">'+esc(mine ? "我" : (m.sender_name || "客服"))+' · '+hm(m.created_at)+'</div></div>';
+    chat.appendChild(row); scrollBottom();
+    return row;
+  }
+
+  function ingest(list){ (list||[]).forEach(function(m){ addMessage(m); }); }
+
+  function api(path, opts){
+    return fetch(path, Object.assign({credentials:"same-origin"}, opts||{})).then(function(r){
+      if(r.status === 503){ showUnavailable(); throw new Error("unavailable"); }
+      if(!r.ok) return r.json().then(function(j){
+        throw new Error(j.detail || j.error || "请求失败");
+      }, function(){ throw new Error("请求失败 ("+r.status+")"); });
+      return r.json();
+    });
+  }
+
+  function showUnavailable(){
+    unavail.style.display = "block";
+    chat.style.display = "none";
+    document.querySelector("footer").style.display = "none";
+  }
+
+  function loadInitial(){
+    return api("/api/cs/guest/"+encodeURIComponent(token)).then(function(d){
+      setClosed(d.conversation && d.conversation.status === "closed");
+      ingest(d.messages);
+    });
+  }
+
+  function poll(){
+    api("/api/cs/guest/"+encodeURIComponent(token)+"?after_id="+lastId)
+      .then(function(d){
+        ingest(d.messages);
+        setClosed(d.conversation && d.conversation.status === "closed");
+      }, function(){});
+  }
+  function startPolling(){
+    if(pollTimer) return;
+    pollTimer = setInterval(poll, 4000);
+  }
+  function stopPolling(){
+    if(pollTimer){ clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  // ── SSE 智能重连（不 location.reload，保留页面状态）──
+  function connect(){
+    if(!window.EventSource){ startPolling(); return; }
+    if(es) return; // 已有连接
+    es = new EventSource("/api/cs/guest/"+encodeURIComponent(token)+"/stream");
+    es.addEventListener("message", function(ev){
+      esRetry = 0;
+      refreshStatus();
+      var evt; try{ evt = JSON.parse(ev.data); }catch(e){ return; }
+      if(evt.type === "message" && evt.message) addMessage(evt.message);
+      if(evt.type === "conversation" && evt.conversation)
+        setClosed(evt.conversation.status === "closed");
+    });
+    es.addEventListener("open", function(){ refreshStatus(); });
+    es.onerror = function(){
+      // 断开：关闭旧连接，启动轮询兜底，按退避重连 SSE
+      if(es){ es.close(); es = null; }
+      refreshStatus();
+      startPolling();
+      var delay = Math.min(1000 * Math.pow(2, esRetry), 15000);
+      esRetry = Math.min(esRetry + 1, 6);
+      if(esTimer) clearTimeout(esTimer);
+      esTimer = setTimeout(function(){ esTimer = null; connect(); }, delay);
+    };
+  }
+
+  function disconnect(){
+    if(es){ es.close(); es = null; }
+    if(esTimer){ clearTimeout(esTimer); esTimer = null; }
+  }
+
+  // ── 发送队列处理 ──
+  function enqueueSend(text){
+    var item = { idemKey: uuid(), text: text, el: null, status: "pending", retry: 0 };
+    // 乐观渲染
+    item.el = addMessage({sender_kind:"customer", text:text,
+      created_at:Math.floor(Date.now()/1000)}, {optimistic:true});
+    if(item.el){
+      item.el.dataset.idemKey = item.idemKey;
+      var meta = item.el.querySelector(".meta");
+      if(meta) meta.innerHTML += ' <span class="send-state" data-state="sending">发送中…</span>';
+    }
+    sendQueue.push(item);
+    processQueue();
+  }
+
+  function setSendState(item, state, msg){
+    if(!item.el) return;
+    var tag = item.el.querySelector(".send-state");
+    if(!tag){
+      var meta = item.el.querySelector(".meta");
+      if(!meta) return;
+      tag = document.createElement("span");
+      tag.className = "send-state";
+      meta.appendChild(tag);
+    }
+    tag.dataset.state = state;
+    tag.textContent = state === "sending" ? "发送中…"
+      : state === "failed" ? ("失败" + (msg ? "：" + msg : "") + "，点击重试")
+      : "";
+    if(state === "failed"){
+      tag.style.cursor = "pointer";
+      tag.style.color = "#ff453a";
+      tag.onclick = function(){ retryItem(item); };
+    }
+  }
+
+  function retryItem(item){
+    item.status = "pending";
+    item.retry = 0;
+    setSendState(item, "sending");
+    processQueue();
+  }
+
+  function processQueue(){
+    if(sending || !sendQueue.length) return;
+    var item = sendQueue[0];
+    if(item.status !== "pending"){ sendQueue.shift(); processQueue(); return; }
+    sending = true;
+    setSendState(item, "sending");
+    api("/api/cs/guest/"+encodeURIComponent(token)+"/messages", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({text:item.text, idem_key:item.idemKey,
+        nickname: localStorage.getItem("mmm_cs_nick")||""})
+    }).then(function(d){
+      // 成功：用服务端消息替换乐观气泡（更新真实 id/时间）
+      var m = d.message || {};
+      if(m.id){ lastId = Math.max(lastId, m.id); }
+      if(item.el){
+        var meta = item.el.querySelector(".meta");
+        if(meta){
+          var who = "我";
+          meta.innerHTML = esc(who)+' · '+hm(m.created_at);
+        }
+        item.el.dataset.msgId = m.id || "";
+      }
+      sendQueue.shift();
+      sending = false;
+      setClosed(d.status === "closed");
+      processQueue();
+    }, function(e){
+      item.retry++;
+      if(item.retry < MAX_RETRY && online){
+        // 退避重试
+        var delay = Math.min(1000 * Math.pow(2, item.retry - 1), 10000);
+        setSendState(item, "sending");
+        setTimeout(function(){ sending = false; processQueue(); }, delay);
+      } else {
+        item.status = "failed";
+        setSendState(item, "failed", e.message || "网络错误");
+        sending = false;
+        sendQueue.shift();
+        processQueue();
+      }
+    });
+  }
+
+  function send(){
+    var text = input.value.trim();
+    if(!text) return;
+    input.value = ""; autosize();
+    enqueueSend(text);
+  }
+
+  function autosize(){
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 96) + "px";
+  }
+
+  sendBtn.addEventListener("click", send);
+  input.addEventListener("input", autosize);
+  input.addEventListener("keydown", function(e){
+    if(e.key === "Enter" && !e.shiftKey && !e.isComposing){ e.preventDefault(); send(); }
+  });
+
+  // ── 离线/在线检测 ──
+  window.addEventListener("online", function(){ online = true; refreshStatus(); poll(); processQueue(); });
+  window.addEventListener("offline", function(){ online = false; refreshStatus(); });
+
+  // ── 切后台恢复：回到前台时重连 SSE 并补拉未读 ──
+  document.addEventListener("visibilitychange", function(){
+    if(document.visibilityState === "visible"){
+      poll();
+      if(!es) connect();
+      else refreshStatus();
+    }
+  });
+
+  if(!token){ showUnavailable(); return; }
+  loadInitial().then(connect, function(e){
+    if(String(e.message).indexOf("unavailable") >= 0) return;
+    refreshStatus();
+    setTimeout(function(){ loadInitial().then(connect, function(){}); }, 3000);
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,4 +1,4 @@
-"""CreatorHub 一键安装、启动与自检入口。
+"""mmm 一键安装、启动与自检入口。
 
 这个文件只使用 Python 标准库，因此可以在项目依赖尚未安装时直接运行。
 常用命令：
@@ -32,7 +32,7 @@ MIN_PYTHON = (3, 10)
 
 
 def log(message: str) -> None:
-    print(f"[CreatorHub] {message}", flush=True)
+    print(f"[mmm] {message}", flush=True)
 
 
 def venv_python() -> Path:
@@ -272,7 +272,7 @@ def check() -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="CreatorHub 一键安装与启动",
+        description="mmm 一键安装与启动",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(

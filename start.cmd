@@ -20,7 +20,7 @@ if not errorlevel 1 (
     exit /b !errorlevel!
 )
 
-echo [CreatorHub] Python 3.10 or newer is required.
-echo [CreatorHub] Install Python, enable "Add Python to PATH", then run start.cmd again.
+echo [mmm] Python 3.10 or newer is required.
+echo [mmm] Install Python, enable "Add Python to PATH", then run start.cmd again.
 pause
 exit /b 1

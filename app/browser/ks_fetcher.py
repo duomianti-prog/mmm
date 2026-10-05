@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from .identity import Identity
@@ -592,7 +594,14 @@ async def fetch_ks_self_profile(mgr: BrowserManager, identity: Identity,
 
 
 # ── 快手发评论(浏览器自动化)──
-# 评论输入框 / 发送按钮选择器(快手改版时改这里)
+# 评论提交接口端点候选(快手改版时改这里)
+# 实测标定:/rest/v/photo/comment/add 是主端点,但也可能见到 addV2/commentAdd 变体
+_COMMENT_ADD_ENDPOINTS = (
+    "/rest/v/photo/comment/add",
+    "/rest/v/photo/comment/addV2",
+    "/rest/v/photo/comment/commentAdd",
+    "/comment/add",
+)
 _COMMENT_INPUT = [
     'textarea[placeholder*="评论"]',
     'div[contenteditable="true"][placeholder*="评论"]',
@@ -607,6 +616,40 @@ _COMMENT_SUBMIT = [
     '.submit-btn',
     'span:has-text("发送")',
 ]
+
+
+async def _dump_comment_diag(page, tag: str) -> str:
+    """保存评论页诊断快照：页面截图 + 评论相关 DOM 摘要。"""
+    try:
+        _DEBUG_DIR = Path("./data/debug")
+        _DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = _DEBUG_DIR / f"ks_comment_{tag}_{stamp}"
+        png = str(base.with_suffix(".png"))
+        try:
+            await page.screenshot(path=png, full_page=True)
+        except Exception:
+            png = ""
+        try:
+            # 只打印评论相关 DOM，避免全文过大
+            text = await page.locator("body").inner_text()
+            # 提取评论区域关键信息
+            comment_section = ""
+            for marker in ("评论", "共", "条评论"):
+                idx = text.find(marker)
+                if idx >= 0:
+                    comment_section = text[max(0, idx - 200):idx + 500]
+                    break
+            if not comment_section:
+                comment_section = text[:2000]
+        except Exception:
+            comment_section = ""
+        base.with_suffix(".txt").write_text(
+            f"url: {page.url}\n\ncomment_section:\n{comment_section[:4000]}",
+            encoding="utf-8")
+        return png
+    except Exception:
+        return ""
 
 
 async def post_ks_comment(mgr: BrowserManager, identity: Identity, photo_id: str,
@@ -627,14 +670,15 @@ async def post_ks_comment(mgr: BrowserManager, identity: Identity, photo_id: str
         page = await mgr.new_page(identity, block_media=False)
     # 拦截评论提交接口。快手评论读取走 REST v2(/rest/v/photo/comment/list),
     # 提交大概率是同族的 /rest/v/photo/comment/add(result==1 表示成功);
-    # 同时兜底 graphql 的 visionAddComment mutation。⚠️ add 端点名需真机抓包确认。
+    # 同时兜底 graphql 的 visionAddComment mutation。
     pub = {"seen": False, "ok": False, "msg": ""}
 
     async def on_response(resp):
         if pub["seen"]:
             return
         url = resp.url
-        is_rest_add = "/rest/v/photo/comment/add" in url or "/comment/add" in url
+        # 检查是否匹配任一候选端点(支持 V2/commentAdd 变体)
+        is_rest_add = any(endpoint in url for endpoint in _COMMENT_ADD_ENDPOINTS)
         if not is_rest_add and GRAPHQL_API not in url:
             return
         try:
@@ -680,7 +724,8 @@ async def post_ks_comment(mgr: BrowserManager, identity: Identity, photo_id: str
             except Exception:
                 continue
         if editor is None:
-            return False, "未找到评论输入框(评论区可能未加载/被关闭/页面改版)"
+            diag = await _dump_comment_diag(page, "no-input")
+            return False, f"未找到评论输入框(评论区可能未加载/被关闭/页面改版)。DOM诊断: {diag}"
 
         await editor.click(timeout=timeout_ms)
         await page.wait_for_timeout(300)
@@ -704,7 +749,8 @@ async def post_ks_comment(mgr: BrowserManager, identity: Identity, photo_id: str
             except Exception:
                 pass
         if not sent:
-            return False, "未找到发送按钮且回车提交失败"
+            diag = await _dump_comment_diag(page, "no-submit")
+            return False, f"未找到发送按钮且回车提交失败。DOM诊断: {diag}"
 
         for _ in range(27):       # 等提交接口回包,最多 ~8s
             if pub["seen"]:

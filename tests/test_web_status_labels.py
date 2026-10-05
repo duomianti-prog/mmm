@@ -15,15 +15,17 @@ def test_xhs_note_card_uses_chinese_status_label_mapper():
     assert ">${r.download_status}${r.error" not in note_card
 
 
-def test_keyword_collection_is_douyin_only_and_has_edit_action():
+def test_keyword_collection_is_capability_gated_and_has_edit_action():
     source = APP_JS.read_text(encoding="utf-8")
     html = INDEX_HTML.read_text(encoding="utf-8")
 
-    assert 'PLATFORM !== "douyin" && CURRENT_TAB === "collections"' in source
-    assert 'platform: "douyin", account_id: accountId' in source
+    # Task 8:采集入口由 keyword_collection 能力门控(douyin/tiktok 可见)
+    assert '!pfCan(PLATFORM, "keyword_collection") && CURRENT_TAB === "collections"' in source
+    assert 'platform: PLATFORM, account_id: accountId' in source
     assert 'onclick="editCollection(${job.id})"' in source
     assert '@app.put' not in html
-    assert "新建抖音关键词采集" in html
+    assert "新建关键词采集" in html
+    assert "新建抖音关键词采集" not in html
     assert "小红书笔记" not in source[source.index("collections: {"):source.index("comments: {")]
 
 

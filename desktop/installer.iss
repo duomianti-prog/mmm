@@ -4,27 +4,27 @@
   #define AppVersion "0.2.0"
 #endif
 #ifndef AppSourceDir
-  #define AppSourceDir "..\dist\windows\CreatorHub"
+  #define AppSourceDir "..\dist\windows\mmm"
 #endif
 [Setup]
 AppId={{93FD4B37-6436-4CE0-8249-BC487CC5A062}
-AppName=CreatorHub
+AppName=mmm
 AppVersion={#AppVersion}
-AppVerName=CreatorHub v{#AppVersion}
-AppPublisher=CreatorHub
+AppVerName=mmm v{#AppVersion}
+AppPublisher=mmm
 AppPublisherURL=https://github.com/3441293738/creatorhub
-DefaultDirName={localappdata}\Programs\CreatorHub
-DefaultGroupName=CreatorHub
+DefaultDirName={localappdata}\Programs\mmm
+DefaultGroupName=mmm
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 OutputDir=..\dist\installer
-OutputBaseFilename=CreatorHub-Setup-{#AppVersion}-windows-x64
+OutputBaseFilename=mmm-Setup-{#AppVersion}-windows-x64
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-UninstallDisplayIcon={app}\CreatorHub.exe
+UninstallDisplayIcon={app}\mmm.exe
 CloseApplications=yes
 RestartApplications=no
 SetupLogging=yes
@@ -40,11 +40,11 @@ DialogFontName=Microsoft YaHei UI
 WelcomeFontName=Microsoft YaHei UI
 
 [CustomMessages]
-LaunchCreatorHub=启动 CreatorHub
+LaunchCreatorHub=启动 mmm
 InstallingWebView2=正在安装 Microsoft WebView2 运行环境，请保持网络连接…
 WebView2StartFailed=WebView2 安装程序启动失败，请重新运行安装包。
-WebView2Required=需要安装 Microsoft WebView2 运行环境才能继续。请检查网络连接后重试，原有 CreatorHub 数据保持不变。
-UninstallKeepData=卸载将保留账号资料、配置、下载内容和备份。%n%n用户数据目录：%1%n%n卸载前请先退出 CreatorHub。如不再需要这些数据，可在卸载完成后自行备份并清理该目录。
+WebView2Required=需要安装 Microsoft WebView2 运行环境才能继续。请检查网络连接后重试，原有 mmm 数据保持不变。
+UninstallKeepData=卸载将保留账号资料、配置、下载内容和备份。%n%n用户数据目录：%1%n%n卸载前请先退出 mmm。如不再需要这些数据，可在卸载完成后自行备份并清理该目录。
 
 [Files]
 Source: "..\build\windows\MicrosoftEdgeWebview2Setup.exe"; Flags: dontcopy
@@ -54,17 +54,17 @@ Source: "{#AppSourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdi
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: checkedonce
 
 [Icons]
-Name: "{group}\CreatorHub"; Filename: "{app}\CreatorHub.exe"
-Name: "{autodesktop}\CreatorHub"; Filename: "{app}\CreatorHub.exe"; Tasks: desktopicon
+Name: "{group}\mmm"; Filename: "{app}\mmm.exe"
+Name: "{autodesktop}\mmm"; Filename: "{app}\mmm.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\CreatorHub.exe"; Description: "{cm:LaunchCreatorHub}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\mmm.exe"; Description: "{cm:LaunchCreatorHub}"; Flags: nowait postinstall skipifsilent
 
 ; Delta updates can add application-owned files not in the original install log.
 ; User data lives outside {app}; never delete the parent/user-data directories.
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\_internal"
-Type: files; Name: "{app}\CreatorHub.exe"
+Type: files; Name: "{app}\mmm.exe"
 
 [Code]
 function HasWebView2(): Boolean;
@@ -108,5 +108,5 @@ function InitializeUninstall(): Boolean;
 begin
   Result := True;
   if not UninstallSilent then
-    MsgBox(FmtMessage(CustomMessage('UninstallKeepData'), [ExpandConstant('{localappdata}\CreatorHub\user-data')]), mbInformation, MB_OK);
+    MsgBox(FmtMessage(CustomMessage('UninstallKeepData'), [ExpandConstant('{localappdata}\mmm\user-data')]), mbInformation, MB_OK);
 end;

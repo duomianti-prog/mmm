@@ -365,7 +365,7 @@ async function run() {
     await monitor.run('runNow(11)');
     assert.equal(monitorToasts.at(-1).type, tone);
     assert.ok(monitorToasts.at(-1).message.includes(message));
-    assert.ok(!monitorToasts.at(-2).message.includes('开浏览器'));
+    // v1.3.6 后点击不再预弹 toast,只保留最终结果;旧 toast 链长度断言取消
   }
 
   console.log(`UI regression checks passed (${process.env.TZ})`);

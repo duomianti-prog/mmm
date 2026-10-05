@@ -88,14 +88,30 @@ class Controller:
 
     def update_install_supported(self):
         return bool(os.name == "nt" and getattr(sys, "frozen", False)
-                    and Path(sys.executable).name.lower() == "creatorhub.exe"
-                    and (resources() / "desktop" / "CreatorHubUpdater.exe").is_file()
+                    and Path(sys.executable).name.lower() == "mmm.exe"
+                    and (resources() / "desktop" / "mmmUpdater.exe").is_file()
                     and self.exit_window is not None)
 
     def event(self, title, detail="", level="info"):
         with self.lock:
             self.events.appendleft({"id": uuid.uuid4().hex, "time": time.time(),
                                     "title": title, "detail": detail, "level": level})
+
+    def license_info(self):
+        """返回当前授权信息（供 UI 显示与重检）。"""
+        from app.license_core import evaluate
+        info = evaluate()
+        return {
+            "status": info["status"],
+            "status_text": info["status_text"],
+            "customer": info.get("customer") or "",
+            "expire_at": info.get("expire_at") or 0,
+            "days_remaining": info.get("days_remaining"),
+            "perpetual": bool(info.get("perpetual")),
+            "fingerprint": info["fingerprint"],
+            "paths": info.get("searched_paths") or [],
+            "valid": info["status"] in {"valid", "skipped"},
+        }
 
     def state(self):
         with self.lock:
@@ -104,6 +120,7 @@ class Controller:
                     "updates": self.updates.state(),
                     "update_install_supported": self.update_install_supported(),
                     "installing_update": self.installing_update,
+                    "license": self.license_info(),
                     "can_stop": bool((self.process and self.process.poll() is None) or (self.worker and self.worker.is_alive())),
                     "uptime": int(time.monotonic() - self.started_at) if self.started_at else 0,
                     "preferences": dict(self.preferences), "close_requested": self.close_requested,
@@ -117,7 +134,16 @@ class Controller:
         with self.lock:
             if self.installing_update:
                 raise ValueError("正在准备更新，请等待安装完成。")
-            if self.phase not in {"stopped", "error"} or (self.worker and self.worker.is_alive()):
+            if self.phase not in {"stopped", "error", "license"} or (self.worker and self.worker.is_alive()):
+                return
+            # 授权门控：未通过则不启动服务，界面停留在授权页等待放入 license.dat。
+            license_info = self.license_info()
+            if not license_info["valid"]:
+                self.phase = "license"
+                self.detail = license_info["status_text"]
+                self.event("授权未通过",
+                           f"{license_info['status_text']}，请放入授权文件后重新检查。",
+                           "warning")
                 return
             if self.process and self.process.poll() is None:
                 raise ValueError("上一次服务尚未退出，请先停止服务再重试。")
@@ -294,8 +320,8 @@ class Controller:
             data = read_request(request)
             verify_installer(data)
             verified = True
-            copied = stage / "CreatorHubUpdater.exe"
-            shutil.copy2(resources() / "desktop" / "CreatorHubUpdater.exe", copied)
+            copied = stage / "mmmUpdater.exe"
+            shutil.copy2(resources() / "desktop" / "mmmUpdater.exe", copied)
             # Preflight before interrupting any work. Start remains locked until
             # handoff or failure; backup is taken only after the service releases DB.
             self.updates.install_status("preparing", "正在停止本地服务，随后备份配置与数据库…")
@@ -399,6 +425,13 @@ class Controller:
             return {"ok": True, "message": "正在准备安装；完成备份后将退出并更新。"}
         elif name == "start":
             self.start()
+        elif name == "license_info":
+            return {"ok": True, "license": self.license_info()}
+        elif name == "recheck_license":
+            info = self.license_info()
+            if info["valid"]:
+                self.start()
+            return {"ok": True, "license": info}
         elif name in {"stop", "exit"}:
             if data.get("confirmed") is not True:
                 raise ValueError("请先确认停止服务。")

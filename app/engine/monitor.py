@@ -9,6 +9,7 @@ import json
 import logging
 import random
 import time
+import unicodedata
 from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -29,6 +30,9 @@ from ..browser import (BrowserManager, fetch_videos, fetch_comments,
                        fetch_channels_self_profile, post_channels_comment,
                        fetch_account_works, fetch_douyin_account_works_api,
                        do_follow, send_dm, send_dm_api)
+from ..platforms.tiktok import (follow_tiktok_browser,
+                                fetch_tiktok_dm_conversations,
+                                send_tiktok_dm)
 from . import compose
 from ..config import Config
 from ..account_lifecycle import AccountUnavailableError
@@ -50,6 +54,18 @@ from ..platforms.kuaishou import (parse_ks_feed, parse_ks_comment,
 from ..platforms.channels import (parse_channels_feed, parse_channels_comment,
                    flatten_channels_comments, parse_self_user as parse_channels_self_user,
                    publish_channels)
+from ..platforms import registry as platforms
+from ..platforms.tiktok import (
+    comment_tiktok_browser,
+    fetch_tiktok_comments,
+    fetch_tiktok_self_profile,
+    fetch_tiktok_works,
+    norm_tiktok_work,
+    parse_tiktok_comment,
+    parse_tiktok_item,
+    parse_tiktok_self_user,
+    publish_tiktok,
+)
 from ..models import (ContentRecord, CommentRecord, CommentRule, CommentTask,
                       CommentWatch, DanmakuWatch, DanmakuRecord,
                        DouyinAccount, MonitorTarget, AccountRiskState,
@@ -130,6 +146,57 @@ def _monitor_strategy(target: MonitorTarget, *, default_scrolls: int,
         "includes": _monitor_terms(getattr(target, "include_keywords", "[]") or "[]"),
         "excludes": _monitor_terms(getattr(target, "exclude_keywords", "[]") or "[]"),
     }
+
+
+def _strip_emoji_tokens(text: str) -> str:
+    """去掉抖音文本态表情占位([666]/[微笑] 等方括号短 token)。"""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "[":
+            j = text.find("]", i + 1, i + 12)
+            inner = text[i + 1:j] if j != -1 else ""
+            if j != -1 and inner and not any(c.isspace() or c in "[]"
+                                             for c in inner):
+                i = j + 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _comment_pure_emoji(text: str) -> bool:
+    """正文去掉空白与 [表情] 占位后只剩 Unicode 表情/符号修饰字符 → 纯表情评论。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return False   # 空文本(纯图片等)不在此过滤,避免误伤
+    t = _strip_emoji_tokens(raw).strip()
+    if not t:
+        return True    # 全是 [表情] 占位
+    for ch in t:
+        if ch.isspace():
+            continue
+        # So=符号/表情, Sk=修饰符号, Mn=组合符(肤色/键帽/VS16), Cf=ZWJ 等
+        if unicodedata.category(ch) not in ("So", "Sk", "Mn", "Cf"):
+            return False
+    return True
+
+
+# 评论入库只看最近 3 天:更久远的评论对监控/回复都没有价值,还拖慢翻页抓取。
+_COMMENT_MAX_AGE_SECONDS = 3 * 86400
+
+
+def _comment_keep(c: dict, now_ts: int | None = None) -> bool:
+    """评论入库前过滤:纯表情;有评论时间且早于最近 3 天(无时间字段保留防漏抓)。"""
+    if _comment_pure_emoji(c.get("text") or ""):
+        return False
+    ct = int(c.get("create_time") or 0)
+    if ct > 0:
+        cutoff = (int(time.time()) if now_ts is None
+                  else int(now_ts)) - _COMMENT_MAX_AGE_SECONDS
+        if ct < cutoff:
+            return False
+    return True
 
 
 def _monitor_content_matches(aw: Aweme, strategy: dict,
@@ -233,6 +300,10 @@ def _round_robin_by_account(rows: list[tuple[int, int | None]]) \
     return ordered
 
 
+class AccountBusyError(RuntimeError):
+    """账号锁在限定时间内拿不到(被同账号另一个浏览器任务长期占用)。"""
+
+
 class MonitorEngine:
     def __init__(self, cfg: Config, browser: BrowserManager):
         self.cfg = cfg
@@ -241,7 +312,9 @@ class MonitorEngine:
             cfg.engine.media_dir, cfg.engine.user_agent,
             cfg.engine.download_timeout_seconds,
         )
-        self.keyword_collector = KeywordCollector(cfg, browser, self.downloader)
+        self.keyword_collector = KeywordCollector(
+            cfg, browser, self.downloader,
+            yield_checker=self._manual_priority_active)
         self.dm_automation = XhsDmAutomation(cfg, browser)
         self.dm_automation.set_wake_callback(self._on_xhs_dm_wake)
         self._dm_poll_locks: dict[int, asyncio.Lock] = {}
@@ -256,6 +329,10 @@ class MonitorEngine:
         self._publishing: set[int] = set()
         self._commenting: set[int] = set()         # 正在执行的评论任务 id
         self._actioning: set[int] = set()           # 正在执行的写操作任务 id
+        # account_id -> 人工优先信号的过期时间戳:期间后台长采集在取消点让位
+        self._manual_priority: dict[int, float] = {}
+        # 账号锁 key -> 当前持锁操作的人类可读标签(用于“账号忙”提示)
+        self._lock_owner: dict[str, str] = {}
         self._collection_tasks: dict[int, asyncio.Task] = {}  # 一次性关键词采集
         self._last_acct_check = time.time()   # 上次账号体检时间
         self._geo_checked: dict = {}          # account_id -> 已校验过地区的代理(避免重复探测)
@@ -399,19 +476,68 @@ class MonitorEngine:
         with get_session() as s:
             return s.get(DouyinAccount, account_id)
 
+    # ── 人工优先:手动“立即发”期间,同账号后台长采集在取消点主动让位 ──
+    def request_manual_priority(self, account_id: int | None,
+                                ttl: float | None = None) -> None:
+        if not account_id:
+            return
+        if ttl is None:
+            ttl = max(30.0, self.cfg.engine.manual_lock_wait_seconds + 60.0)
+        self._manual_priority[account_id] = time.time() + ttl
+
+    def _manual_priority_active(self, account_id: int | None) -> bool:
+        if not account_id:
+            return False
+        return time.time() < self._manual_priority.get(int(account_id), 0.0)
+
+    def _clear_manual_priority(self, account_id: int | None) -> None:
+        if account_id:
+            self._manual_priority.pop(int(account_id), None)
+
     @asynccontextmanager
     async def _operation_guard(self, account_id, kind: OperationKind,
-                               fallback_key: str = "", operation_target=None):
-        """Serialize by global limit, network exit, then account profile."""
+                               fallback_key: str = "", operation_target=None,
+                               acquire_timeout: float | None = None,
+                               operation_label: str = ""):
+        """Serialize by global limit, network exit, then account profile.
+
+        acquire_timeout 给定时,等待账号锁超过该秒数会抛 AccountBusyError,
+        避免人工任务在锁队列里无限挂起。
+        """
         account = operation_target or self._load_account(account_id)
         key = f"acc:{account_id}" if account_id else (fallback_key or "anon")
         lock = self.browser.lock_for(key)
+        kind_labels = {
+            OperationKind.READ_LIGHT: "后台监控",
+            OperationKind.READ_HEAVY: "后台采集",
+            OperationKind.DOWNLOAD: "媒体下载",
+            OperationKind.PUBLISH: "作品发布",
+            OperationKind.COMMENT: "评论发布",
+            OperationKind.SOCIAL: "关注/互动",
+            OperationKind.DM: "私信发送",
+            OperationKind.LOGIN: "登录",
+        }
+        label = operation_label or kind_labels.get(kind, "另一个任务")
         async with self._active_sem:
             async with self.risk.network_guard(account):
-                async with lock:
+                if acquire_timeout is None:
+                    await lock.acquire()
+                else:
+                    try:
+                        await asyncio.wait_for(lock.acquire(), timeout=acquire_timeout)
+                    except asyncio.TimeoutError:
+                        owner = self._lock_owner.get(key, "另一个后台任务")
+                        raise AccountBusyError(
+                            f"该账号的 Chrome 正被「{owner}」占用,请稍后重试"
+                            f"(已等待约 {int(acquire_timeout)} 秒)")
+                try:
+                    self._lock_owner[key] = label
                     if account_id and self._load_account(account_id) is None:
                         raise AccountUnavailableError("绑定账号已删除，操作已停止")
                     yield account
+                finally:
+                    self._lock_owner.pop(key, None)
+                    lock.release()
 
     def _fail_missing_account_task(self, model, task_id: int) -> dict:
         with get_session() as session:
@@ -441,32 +567,55 @@ class MonitorEngine:
             yield account
 
     async def _guarded_read_dict(self, account_id, kind: OperationKind,
-                                 fallback_key: str, operation) -> dict:
-        """Run one read through its budget and persist the logical outcome."""
-        decision = self.risk.preflight(account_id, kind)
+                                 fallback_key: str, operation,
+                                 *, interactive_read: bool = False,
+                                 acquire_timeout: float | None = None,
+                                 operation_label: str = "",
+                                 run_timeout: float | None = None) -> dict:
+        """Run one read through its budget and persist the logical outcome.
+
+        acquire_timeout: 手动触发时等待账号锁的上限,超时返回 busy 延后提示而非挂死。
+        run_timeout: 拿到锁后整个读取动作(含开浏览器/翻页)的硬超时。"""
+        def _skipped(reason, next_at=None, **extra):
+            data = {"ok": True, "skipped": True, "reason": reason,
+                    "next_allowed_at": next_at}
+            data.update(extra)
+            return data
+
+        decision = self.risk.preflight(
+            account_id, kind, interactive_read=interactive_read)
         if not decision.allowed:
-            return {
-                "ok": True,
-                "skipped": True,
-                "reason": decision.reason,
-                "next_allowed_at": (
-                    decision.next_allowed_at.isoformat()
-                    if decision.next_allowed_at else None),
-            }
+            return _skipped(
+                decision.reason,
+                decision.next_allowed_at.isoformat()
+                if decision.next_allowed_at else None)
         try:
             async with self._operation_guard(
-                    account_id, kind, fallback_key=fallback_key):
-                decision = self.risk.preflight(account_id, kind)
+                    account_id, kind, fallback_key=fallback_key,
+                    acquire_timeout=acquire_timeout,
+                    operation_label=operation_label):
+                decision = self.risk.preflight(
+                    account_id, kind, interactive_read=interactive_read)
                 if not decision.allowed:
-                    return {
-                        "ok": True,
-                        "skipped": True,
-                        "reason": decision.reason,
-                        "next_allowed_at": (
-                            decision.next_allowed_at.isoformat()
-                            if decision.next_allowed_at else None),
-                    }
-                result = await operation()
+                    return _skipped(
+                        decision.reason,
+                        decision.next_allowed_at.isoformat()
+                        if decision.next_allowed_at else None)
+                if run_timeout is not None:
+                    try:
+                        result = await asyncio.wait_for(
+                            operation(), timeout=run_timeout)
+                    except asyncio.TimeoutError:
+                        # 浏览器启动卡死/页面无响应:协程被 cancel,账号锁由 guard
+                        # 的 finally 释放;不记风控失败,前端提示明确原因。
+                        return {
+                            "ok": False, "skipped": True, "timeout": True,
+                            "new_comments": 0,
+                            "error": (f"抓取超过 {int(run_timeout)} 秒未完成"
+                                      "(可能浏览器启动卡住或页面无响应),已停止,请重试"),
+                        }
+                else:
+                    result = await operation()
                 error = result.get("error")
                 if account_id:
                     if result.get("ok") and not result.get("skipped"):
@@ -477,6 +626,9 @@ class MonitorEngine:
                 if isinstance(error, BaseException):
                     result = dict(result)
                     result["error"] = str(error)
+        except AccountBusyError as exc:
+            # 等锁超时不是平台风控失败:不记 risk、不抛 500,按延后提示返回。
+            return _skipped(str(exc), busy=True, new_comments=0)
         except Exception as exc:
             if account_id:
                 self.risk.record_failure(account_id, kind, exc)
@@ -623,6 +775,83 @@ class MonitorEngine:
             if hasattr(row, name):
                 setattr(row, name, value)
 
+    # ── 瞬时失败自动重试(浏览器崩溃/页面超时/断网;业务硬失败不重试)──
+    _TRANSIENT_ERROR_MARKERS = (
+        "timeout", "timed out", "超时",
+        "target closed", "targetclosed", "target page", "browser closed",
+        "browser has closed", "has been closed",
+        "context was closed", "context closed", "page has been closed",
+        "page crashed", "page.crash", "crashed", "页面崩溃", "页面无响应",
+        "navigation failed", "net::err", "err_connection", "err_network",
+        "err_proxy", "err_timed", "err_internet", "err_socket", "err_name_not",
+        "econnreset", "econnaborted", "econnrefused", "connection aborted",
+        "connection reset", "connection closed", "连接中断", "连接被重置",
+        "网络异常", "网络错误", "断网",
+        "failed to fetch", "frame was detached", "execution context was destroyed",
+        "proxy connection", "代理连接", "代理当前不可用",
+    )
+    # 业务级硬失败:即使文本里含“超时”等字样也绝不自动重试(防重复骚扰/重复提交)
+    _HARD_ERROR_MARKERS = (
+        "未找到目标评论", "未找到该评论", "找不到目标评论",
+        "回复入口", "未找到回复", "评论输入", "评论框", "发送按钮",
+        "未登录", "登录态", "扫码登录", "logged",
+        "已删除", "仅自己可见", "作品不存在", "笔记不存在", "已下架",
+        "每日上限", "每小时上限", "操作频繁", "频率", "上限",
+        "账号不存在", "已失效",
+    )
+
+    def _is_transient_failure(self, err) -> bool:
+        text = str(err or "").strip().lower()
+        if not text:
+            return False
+        if any(m in text for m in self._HARD_ERROR_MARKERS):
+            return False
+        return any(m in text for m in self._TRANSIENT_ERROR_MARKERS)
+
+    def _transient_retry_delay(self, retry_count: int) -> int | None:
+        max_n = max(0, int(self.cfg.engine.transient_retry_max))
+        if retry_count >= max_n:
+            return None
+        try:
+            backoff = [int(x.strip()) for x in str(
+                self.cfg.engine.transient_retry_backoff_seconds).split(",")
+                if x.strip()]
+        except Exception:
+            backoff = []
+        backoff = backoff or [300, 900, 2400]
+        return backoff[min(retry_count, len(backoff) - 1)]
+
+    def _schedule_transient_retry(self, row, err, *, manual: bool,
+                                  keep_schedule: bool = False) -> bool:
+        """把瞬时失败的任务按指数退避重新排队。返回 True 表示已安排重试。
+
+        keep_schedule:发布任务保留用户预约时间,只推迟可执行时刻。
+        """
+        if manual:
+            # 手动“立即发”失败后保留 failed,由用户决定是否再点,不做自动重试。
+            return False
+        retry_count = int(getattr(row, "retry_count", 0) or 0)
+        if retry_count >= max(0, int(self.cfg.engine.transient_retry_max)):
+            return False
+        if not self._is_transient_failure(err):
+            return False
+        delay = self._transient_retry_delay(retry_count)
+        if delay is None:
+            return False
+        row.retry_count = retry_count + 1
+        row.status = "pending"
+        if not keep_schedule:
+            row.scheduled_at = None
+        row.done_at = None
+        self._clear_row_block(row)
+        row.next_allowed_at = datetime.utcnow() + timedelta(seconds=delay)
+        wait_min = max(1, delay // 60)
+        detail = str(err or "").strip()[:380]
+        row.error = (
+            f"{detail}(将于 {wait_min} 分钟后自动重试 "
+            f"{row.retry_count}/{self.cfg.engine.transient_retry_max})")
+        return True
+
     def _xhs_comment_write_mode(self) -> str:
         """Return the explicitly selected XHS comment write mode.
 
@@ -638,6 +867,38 @@ class MonitorEngine:
         mode = str(getattr(self.cfg.engine, "xhs_publish_mode", "browser")
                    or "browser").strip().lower()
         return mode if mode in {"browser", "api"} else "browser"
+
+    @staticmethod
+    def _latest_work_items(items: list, limit: int, recent_days: int) -> list:
+        """按发布时间倒序取最近 N 个作品。
+
+        抖音主页接口把「置顶作品」放在列表最前，直接截前 N 个会挤掉真正
+        最新的作品；这里把置顶项剔除出"最新"窗口（名额有余时才补回），
+        无 create_time 的项按原到达顺序排在有时间项之后。
+
+        recent_days<=0 表示不按发布时间过滤(用于自动回复/评论监控:它们
+        关注的是评论时间而非作品发布时间,旧作品的新评论也需要被处理)。
+        """
+        cutoff = (int(time.time()) - recent_days * 86400) if recent_days and recent_days > 0 else 0
+        normal: list = []
+        pinned: list = []
+        for idx, it in enumerate(items or []):
+            ct = int(it.get("create_time") or 0)
+            is_top = bool(it.get("is_top")) or str(it.get("top", "") or "") == "1" \
+                or str(it.get("top_status", "") or "") not in ("", "0")
+            if is_top:
+                # 置顶作品可能很旧,但仍挂在主页最前;不参与"最新"窗口,只在名额有余时补回
+                pinned.append((ct, idx, it))
+                continue
+            if cutoff and ct and ct < cutoff:
+                continue
+            normal.append((ct, idx, it))
+        # 发布时间倒序；时间为 0 的保持到达顺序排在最后
+        normal.sort(key=lambda r: (-r[0], r[1]) if r[0] else (1, r[1]))
+        picked = normal[:max(0, limit)]
+        if len(picked) < limit:
+            picked += pinned[: max(0, limit) - len(picked)]
+        return [r[2] for r in picked]
 
     def _douyin_write_mode(self) -> str:
         """Return the selected Douyin write transport.
@@ -905,7 +1166,9 @@ class MonitorEngine:
                                         if decision.next_allowed_at else None)}
 
         try:
-            async with self._operation_guard(account_id, OperationKind.READ_HEAVY):
+            async with self._operation_guard(
+                    account_id, OperationKind.READ_HEAVY,
+                    operation_label="关键词采集"):
                 decision = self.risk.preflight(account_id, OperationKind.READ_HEAVY)
                 if not decision.allowed:
                     with get_session() as s:
@@ -939,7 +1202,38 @@ class MonitorEngine:
                     job.finished_at = None
                     s.add(job); s.commit()
                     account = s.get(DouyinAccount, account_id)
-                result = await self.keyword_collector.run(job_id, account)
+                # 硬超时:浏览器卡死/Chrome 被手动关闭时,采集也不能无限占着账号锁。
+                try:
+                    result = await asyncio.wait_for(
+                        self.keyword_collector.run(job_id, account),
+                        timeout=max(30, self.cfg.engine.keyword_job_timeout_seconds))
+                except asyncio.TimeoutError:
+                    log.warning("关键词采集 %s 单轮硬超时,已让出账号锁并重新排队",
+                                job_id)
+                    with get_session() as s:
+                        job = s.get(KeywordCollectionJob, job_id)
+                        if job and job.status == "running" and not job.cancel_requested:
+                            job.status = "pending"
+                            job.current_step = "单轮采集超时,10 分钟后自动继续"
+                            job.next_allowed_at = (
+                                datetime.utcnow() + timedelta(seconds=600))
+                            job.finished_at = None
+                            s.add(job); s.commit()
+                    return {"ok": True, "deferred": True, "timed_out": True}
+
+            # 人工任务优先:本轮在取消点主动让位,短延迟后继续,不计失败。
+            if result.get("yielded"):
+                with get_session() as s:
+                    job = s.get(KeywordCollectionJob, job_id)
+                    if job and job.status == "running" and not job.cancel_requested:
+                        job.status = "pending"
+                        job.current_step = "人工操作优先,2 分钟后自动继续采集"
+                        job.next_allowed_at = (
+                            datetime.utcnow() + timedelta(seconds=120))
+                        job.finished_at = None
+                        s.add(job); s.commit()
+                log.info("关键词采集 %s 已为人工任务让位,稍后自动继续", job_id)
+                return {"ok": True, "deferred": True, "yielded": True}
 
             with get_session() as s:
                 job = s.get(KeywordCollectionJob, job_id)
@@ -1055,6 +1349,29 @@ class MonitorEngine:
                         " —— 关联/风控风险,建议换地区一致的长效代理或改账号时区",
                         account_id, geo["country"], timezone_id, expected, geo.get("ip"))
 
+    async def _platform_network_gate(self, account_id, platform, proxy):
+        """平台级硬闸门(当前仅 TikTok):无代理/出口不符/探测失败即阻断本轮。
+
+        与 _verify_proxy_region 的区别:后者只告警,这里返回结果由调用方决定跳过。
+        无策略注册的平台返回 None(完全等价旧行为)。
+        """
+        if platforms.get_network_policy(platform) is None:
+            return None
+        with get_session() as s:
+            acc = s.get(DouyinAccount, account_id)
+            required = acc.required_exit_country if acc else ""
+        ready = await platforms.run_network_gate(
+            platform, cfg=self.cfg, proxy=proxy,
+            required_country=required or "", account_id=account_id)
+        if ready and ready.get("ok"):
+            with get_session() as s:
+                acc = s.get(DouyinAccount, account_id)
+                if acc:
+                    platforms.apply_network_ready(platform, acc, ready)
+                    s.add(acc)
+                    s.commit()
+        return ready
+
     # ── 账号登录态体检 + 风险恢复探测 ──
     def _account_probe_tuple(self, account):
         return (account.id, account.platform, account.storage_state,
@@ -1114,6 +1431,10 @@ class MonitorEngine:
                             "reason": decision.reason,
                             "next_allowed_at": decision.next_allowed_at}
                 await self._verify_proxy_region(aid, proxy, identity.timezone_id)
+                gate = await self._platform_network_gate(aid, platform, proxy)
+                if gate is not None and not gate.get("ok"):
+                    return {"ok": False, "indeterminate": True,
+                            "error": gate.get("reason") or "平台网络出口校验未通过"}
                 if platform == "xhs" and self.cfg.engine.xhs_read_mode == "browser":
                     if not self._xhs_browser_reads_enabled():
                         return {"ok": False, "indeterminate": True,
@@ -1179,6 +1500,8 @@ class MonitorEngine:
                     u, err = await fetch_ks_self_profile(self.browser, identity)
                 elif platform == "shipinhao":
                     u, err = await fetch_channels_self_profile(self.browser, identity)
+                elif platform == "tiktok":
+                    u, err = await fetch_tiktok_self_profile(self.browser, identity)
                 else:
                     u, err = await fetch_self_profile(self.browser, identity)
                 if u:
@@ -1201,6 +1524,8 @@ class MonitorEngine:
                     parsed = parse_ks_self_user(u)
                 elif platform == "shipinhao":
                     parsed = parse_channels_self_user(u)
+                elif platform == "tiktok":
+                    parsed = parse_tiktok_self_user(u)
                 else:
                     parsed = parse_self_user(u)
                 account.status = "active"
@@ -1216,6 +1541,10 @@ class MonitorEngine:
                     account.aweme_count = int(parsed.get("aweme_count") or 0)
                     account.total_favorited = int(parsed.get("total_favorited") or 0)
                     account.gender = str(parsed.get("gender") or "")
+                elif platform == "tiktok":
+                    account.follower_count = int(parsed.get("follower_count") or 0)
+                    account.following_count = int(parsed.get("following_count") or 0)
+                    account.aweme_count = int(parsed.get("aweme_count") or 0)
                 else:
                     account.follower_count = parsed.get("follower_count") or account.follower_count
                     account.aweme_count = parsed.get("aweme_count") or account.aweme_count
@@ -1498,6 +1827,8 @@ class MonitorEngine:
             return await self._scan_xhs_target_locked(target_id)
         if platform == "kuaishou":
             return await self._scan_ks_target_locked(target_id)
+        if platform == "tiktok":
+            return await self._scan_tiktok_target_locked(target_id)
         with get_session() as s:
             target = s.get(MonitorTarget, target_id)
             if not target:
@@ -1693,6 +2024,111 @@ class MonitorEngine:
                 t.last_error = msg
                 s.add(t); s.commit()
         return {"ok": False, "new": 0, "error": msg, "skipped": True}
+
+    # ── TikTok:创作者作品监控(浏览器拦截 /api/post/item_list,水位线增量)──
+    async def _scan_tiktok_target_locked(self, target_id: int) -> dict:
+        with get_session() as s:
+            target = s.get(MonitorTarget, target_id)
+            if not target:
+                return {"ok": False, "error": "target not found"}
+            first_scan = target.last_scan_at is None
+            # TikTok 海外网络闸门禁止本机裸连:监控必须绑定已过体检的账号代理
+            if not target.account_id:
+                return self._mark_target_skip(
+                    target_id,
+                    "TikTok 作品监控必须绑定已通过网络体检的账号(禁止本机直连海外)")
+            acc = s.get(DouyinAccount, target.account_id)
+            if not acc or acc.platform != "tiktok" or acc.status != "active":
+                return self._mark_target_skip(
+                    target_id, "绑定的 TikTok 账号不存在或登录态已失效")
+            if self._proxy_bad(acc):
+                return self._mark_target_skip(
+                    target_id, "账号代理标记为不可用(proxy bad),已跳过以免暴露真实 IP")
+            identity, proxy = self._identity_proxy(acc)
+            known = set(s.exec(
+                select(ContentRecord.aweme_id)
+                .where(ContentRecord.target_id == target_id)).all())
+            handle = (target.sec_uid or "").lstrip("@")
+            base_dir = target.download_dir or get_setting(
+                "download_dir", self.cfg.engine.media_dir)
+            quality = target.video_quality or get_setting("video_quality", "highest")
+            auto_download = target.download_enabled
+            media_filter = target.media_filter or "all"
+            strategy = _monitor_strategy(
+                target, default_scrolls=12, default_items=0)
+
+        items, error = await fetch_tiktok_works(
+            self.browser, identity, handle, known,
+            max_scrolls=strategy["max_scrolls"],
+            block_media=self.cfg.engine.block_media_resources,
+            stop_after_known=True)
+
+        new_records = []
+        seen = set()
+        filtered_count = 0
+        author_name = ""
+        author_avatar = ""
+        for item in items:
+            aw = parse_tiktok_item(item, quality)
+            if not aw or aw.aweme_id in seen or aw.aweme_id in known:
+                continue
+            seen.add(aw.aweme_id)
+            if not author_name:
+                author_name = aw.author_name
+                a = (item.get("author") or {}) if isinstance(item, dict) else {}
+                av = a.get("avatarLarger") or a.get("avatarMedium") or {}
+                ul = av.get("urlList") if isinstance(av, dict) else None
+                if isinstance(ul, list):
+                    author_avatar = next(
+                        (u for u in ul if isinstance(u, str)
+                         and u.startswith("http")), "")
+            if not _monitor_content_matches(aw, strategy):
+                filtered_count += 1
+                continue
+            if strategy["max_items"] and len(new_records) >= strategy["max_items"]:
+                break
+            should_download = auto_download and (
+                media_filter == "all" or aw.media_type == media_filter)
+            media_json = json.dumps([{"url": m.url, "kind": m.kind, "ext": m.ext,
+                                      "index": m.index} for m in aw.medias])
+            rec = ContentRecord(
+                platform="tiktok", target_id=target_id, aweme_id=aw.aweme_id,
+                desc=aw.desc, media_type=aw.media_type, quality=aw.quality_label,
+                create_time=aw.create_time, cover_url=aw.cover or "",
+                like_count=aw.like_count, comment_count=aw.comment_count,
+                duration=aw.duration, media_json=media_json,
+                download_status="pending" if should_download else "skipped",
+            )
+            new_records.append((rec, aw, should_download))
+
+        target_name = ""
+        with get_session() as s:
+            for rec, _, _ in new_records:
+                s.add(rec)
+            t = s.get(MonitorTarget, target_id)
+            if t:
+                t.last_scan_at = datetime.utcnow()
+                t.last_error = error
+                if author_name and not t.nickname:
+                    t.nickname = author_name
+                if author_avatar and not t.avatar:
+                    t.avatar = author_avatar
+                s.add(t)
+                target_name = t.nickname or (handle[:12] if handle else "tiktok")
+            s.commit()
+            for rec, _, _ in new_records:
+                s.refresh(rec)
+
+        if new_records and not first_scan:
+            await self._notify_new(target_name, [aw for _, aw, _ in new_records])
+
+        await asyncio.gather(*(self._download(rec.id, aw, base_dir, proxy)
+                               for rec, aw, should_download in new_records
+                               if should_download))
+        # empty=对方账号 0 作品;空串+0 新作品=水位线内无更新,两者都算成功
+        ok = (not error) or error == "empty"
+        return {"ok": ok, "new": len(new_records), "error": "" if ok else error,
+                "scanned": len(seen), "filtered": filtered_count}
 
     # ── 小红书:创作者笔记 / 关键词 监控 ──
     async def _scan_xhs_target_locked(self, target_id: int) -> dict:
@@ -2094,18 +2530,28 @@ class MonitorEngine:
         finally:
             self._inflight.discard(key)
 
-    async def scan_danmaku_watch(self, watch_id: int) -> dict:
+    async def scan_danmaku_watch(self, watch_id: int, *, manual: bool = False) -> dict:
         key = f"dw:{watch_id}"
         if key in self._inflight:
-            return {"ok": True, "new_danmaku": 0, "skipped": "正在抓取中"}
+            return {"ok": True, "new_danmaku": 0, "skipped": True,
+                    "reason": "该监控正在抓取中,请稍候"}
         self._inflight.add(key)
         try:
             with get_session() as s:
                 watch = s.get(DanmakuWatch, watch_id)
                 account_id = watch.account_id if watch else None
-            return await self._guarded_read_dict(
-                account_id, OperationKind.READ_HEAVY, key,
-                lambda: self._scan_danmaku_watch_locked(watch_id))
+            kwargs = self._manual_read_kwargs(account_id, manual, "人工抓取弹幕")
+            try:
+                result = await self._guarded_read_dict(
+                    account_id, OperationKind.READ_HEAVY, key,
+                    lambda: self._scan_danmaku_watch_locked(watch_id),
+                    interactive_read=manual, **kwargs)
+            finally:
+                if manual and account_id:
+                    self._clear_manual_priority(account_id)
+            # 统一延后/超时返回用的是 new_comments,弹幕侧归一化为 new_danmaku。
+            result.setdefault("new_danmaku", result.get("new_comments", 0))
+            return result
         finally:
             self._inflight.discard(key)
 
@@ -2491,19 +2937,26 @@ class MonitorEngine:
             await self.scan_comment_watch(wid)
 
     async def sync_work_comments(self, account_id: int, platform: str, item_id: str,
-                                 xsec_token: str = "") -> dict:
+                                 xsec_token: str = "", *, manual: bool = False) -> dict:
         """抓「本账号某作品」的评论并落库(watch_id=0 标记本账号来源)。
         抖音直连(comment/list 分页 + 回复,参考 CommentAll),小红书走签名直连客户端,
         快手走浏览器拦截。返回 {ok, fetched, added, error}。"""
         key = f"wc:{account_id}:{item_id}"
         if key in self._inflight:
-            return {"ok": True, "fetched": 0, "added": 0, "skipped": "正在抓取中"}
+            return {"ok": True, "fetched": 0, "added": 0, "skipped": True,
+                    "reason": "该作品评论正在抓取中,请稍候"}
         self._inflight.add(key)
         try:
-            result = await self._guarded_read_dict(
-                account_id, OperationKind.READ_HEAVY, key,
-                lambda: self._sync_work_comments_locked(
-                    account_id, platform, item_id, xsec_token))
+            kwargs = self._manual_read_kwargs(account_id, manual, "人工抓取作品评论")
+            try:
+                result = await self._guarded_read_dict(
+                    account_id, OperationKind.READ_HEAVY, key,
+                    lambda: self._sync_work_comments_locked(
+                        account_id, platform, item_id, xsec_token),
+                    interactive_read=manual, **kwargs)
+            finally:
+                if manual and account_id:
+                    self._clear_manual_priority(account_id)
             # A risk-deferred read used to return only ok/skipped/reason.  The
             # work-comments UI then rendered "undefined" as a successful count.
             # Keep one stable response contract for completed and deferred runs.
@@ -2643,10 +3096,11 @@ class MonitorEngine:
                     "configured_mode": configured_mode}
         # 去重落库(watch_id=0 = 本账号作品来源)
         added = 0
+        cs_pending = []
         with get_session() as s:
             for c in fresh:
                 cid = c.get("comment_id")
-                if not cid:
+                if not cid or not _comment_keep(c):
                     continue
                 exists = s.exec(select(CommentRecord).where(
                     CommentRecord.watch_id == 0,
@@ -2656,7 +3110,26 @@ class MonitorEngine:
                     continue
                 s.add(CommentRecord(platform=platform, watch_id=0, aweme_id=item_id, **c))
                 added += 1
+                cs_pending.append(c)
             s.commit()
+        # 客服统一入站总线：本账号新评论按账号接待开关自动建档/镜像
+        # （thread_key = {作品}:{评论}，与评论回投约定一致；总线全局幂等去重）
+        if cs_pending:
+            try:
+                from ..cs import inbound as cs_inbound
+                account_key = acc.sec_uid or acc.uid or ""
+                for c in cs_pending:
+                    cs_inbound.ingest_comment(
+                        platform=platform, account_id=account_id,
+                        account_key=account_key, aweme_id=item_id,
+                        comment_id=str(c.get("comment_id") or ""),
+                        text=str(c.get("text") or ""),
+                        peer_uid=str(c.get("user_sec_uid") or ""),
+                        peer_nickname=str(c.get("user_nickname") or ""),
+                        msg_ts=int(c.get("create_time") or 0))
+            except Exception as cs_exc:
+                log.warning("评论客服联动失败（不影响监控） %s/%s: %s",
+                            platform, item_id, cs_exc)
         return {"ok": not error or added > 0, "fetched": len(fresh),
                 "added": added, "error": error, "source": source,
                 "configured_mode": configured_mode}
@@ -2722,18 +3195,36 @@ class MonitorEngine:
         # 保留 DouyinClient 的分类，让上层决定是否回退浏览器且不清空旧快照。
         return out, (client.last_error or ("" if out else "empty"))
 
-    async def scan_comment_watch(self, watch_id: int) -> dict:
+    def _manual_read_kwargs(self, account_id, manual: bool, label: str) -> dict:
+        """手动「立即抓取」的读保护:请求人工让位 + 等锁上限 + 抓取硬超时。"""
+        if not manual or not account_id:
+            return {}
+        self.request_manual_priority(account_id)
+        return {
+            "acquire_timeout": float(self.cfg.engine.manual_lock_wait_seconds),
+            "operation_label": label,
+            "run_timeout": float(self.cfg.engine.comment_scan_timeout_seconds),
+        }
+
+    async def scan_comment_watch(self, watch_id: int, *, manual: bool = False) -> dict:
         key = f"cw:{watch_id}"
         if key in self._inflight:
-            return {"ok": True, "new_comments": 0, "skipped": "正在抓取中"}
+            return {"ok": True, "new_comments": 0, "skipped": True,
+                    "reason": "该监控正在抓取中,请稍候"}
         self._inflight.add(key)
         try:
             with get_session() as s:
                 w = s.get(CommentWatch, watch_id)
                 account_id = w.account_id if w else None
-            return await self._guarded_read_dict(
-                account_id, OperationKind.READ_HEAVY, key,
-                lambda: self._scan_comment_watch_locked(watch_id))
+            kwargs = self._manual_read_kwargs(account_id, manual, "人工抓取评论")
+            try:
+                return await self._guarded_read_dict(
+                    account_id, OperationKind.READ_HEAVY, key,
+                    lambda: self._scan_comment_watch_locked(watch_id),
+                    interactive_read=manual, **kwargs)
+            finally:
+                if manual and account_id:
+                    self._clear_manual_priority(account_id)
         finally:
             self._inflight.discard(key)
 
@@ -2752,8 +3243,17 @@ class MonitorEngine:
             ua = self.cfg.engine.user_agent
             identity = self.browser.anon_identity()
             has_creator = False
-            if w.account_id:
-                acc = s.get(DouyinAccount, w.account_id)
+            account_id = w.account_id
+            if not account_id:
+                # 历史监控可能未绑账号:回退到同平台唯一有效账号,避免匿名抓取失败
+                actives = [a for a in s.exec(select(DouyinAccount).where(
+                    DouyinAccount.platform == platform,
+                    DouyinAccount.status == "active")).all()
+                    if (a.storage_state or "").strip()]
+                if len(actives) == 1:
+                    account_id = actives[0].id
+            if account_id:
+                acc = s.get(DouyinAccount, account_id)
                 if acc:
                     if self._proxy_bad(acc):
                         msg = "账号代理标记为不可用(proxy bad),已跳过以免暴露真实 IP"
@@ -2810,9 +3310,19 @@ class MonitorEngine:
             elif platform == "kuaishou":   # 单条作品
                 total_new, author = await self._cw_ks_video(watch_id, identity, aweme_id,
                                                             name, first_scan)
+            elif platform == "tiktok" and kind == "user":
+                total_new, author = await self._cw_tiktok_user(
+                    watch_id, identity, sec_uid, name, first_scan)
+            elif platform == "tiktok":   # 单条视频
+                total_new, author = await self._cw_tiktok_video(
+                    watch_id, identity, aweme_id, name, first_scan)
             elif kind == "user" and mode == "creator":
-                total_new, author = await self._cw_creator(watch_id, identity, has_creator,
-                                                           name, first_scan)
+                total_new, author, creator_err = await self._cw_creator(
+                    watch_id, identity, has_creator, name, first_scan)
+                # 创作中心零抓取的证据化原因(页面改版等)透传给前端与 last_error;
+                # 这类 BUSINESS 原因不抛异常、不记风控失败。
+                if total_new == 0 and creator_err:
+                    error = creator_err
             elif kind == "user":
                 total_new, author = await self._cw_user_public(
                     watch_id, identity, sec_uid, name, first_scan,
@@ -2849,6 +3359,9 @@ class MonitorEngine:
     async def _ingest(self, watch_id, aweme_id, fresh, name, work_desc, first_scan,
                       platform="douyin") -> int:
         """fresh: parse_comment 结果(无 aweme_id)。入库 + 按时间水位线推送。"""
+        if not fresh:
+            return 0
+        fresh = [c for c in fresh if _comment_keep(c)]
         if not fresh:
             return 0
         with get_session() as s:
@@ -2940,6 +3453,9 @@ class MonitorEngine:
                 if cfg.douyin_read_mode == "api":
                     log.info("评论监控(账号)API 失败 %s: %s", sec_uid, exc)
                     raise
+        if not items and cfg.douyin_read_mode == "api" and api_client is None:
+            raise RuntimeError(
+                "douyin_api_works:no_cookie(读取模式为 api,但监控未绑定已登录账号)")
         if not items and cfg.douyin_read_mode != "api":
             items, author, browser_err = await fetch_videos(
                 self.browser, identity, sec_uid, set(), max_scrolls=4,
@@ -2949,14 +3465,13 @@ class MonitorEngine:
             raise RuntimeError(f"douyin_api_works:{err}")
         if err:
             log.info("评论监控(账号)%s: %s", sec_uid, err)
-        cutoff = int(time.time()) - settings["recent_days"] * 86400
-        works = []
-        for it in items:
-            aid = str(it.get("aweme_id") or "")
-            ct = int(it.get("create_time") or 0)
-            if aid and (not cutoff or not ct or ct >= cutoff):
-                works.append((aid, (it.get("desc") or "")))
-        works = works[:settings["recent_works"]]
+        works = [
+            (str(it.get("aweme_id") or ""), (it.get("desc") or ""))
+            for it in self._latest_work_items(
+                # 评论监控抓取评论,不限作品发布时间(旧作品的新评论也要收)
+                items, settings["recent_works"], 0)
+            if str(it.get("aweme_id") or "")
+        ]
         total = 0
         for aid, desc in works:
             with get_session() as s:
@@ -2996,13 +3511,19 @@ class MonitorEngine:
         if err:
             log.info("评论监控(快手账号)%s: %s", user_id, err)
         works = []
-        cutoff = int(time.time()) - settings["recent_days"] * 86400
-        for feed in items:
+        # 评论监控抓取评论,不按作品发布时间过滤(旧作品的新评论也要收)
+        parsed = []
+        for idx, feed in enumerate(items):
             aw = parse_ks_feed(feed)
-            if aw and (not aw.create_time or aw.create_time >= cutoff):
-                works.append((aw.aweme_id, aw.desc))
-                if len(works) >= settings["recent_works"]:
-                    break
+            if aw:
+                parsed.append((aw, idx))
+        # 主页可能把置顶/老作品排在前面:按发布时间倒序取最近 N 个作品。
+        parsed.sort(key=lambda r: (-r[0].create_time, r[1])
+                    if r[0].create_time else (1, r[1]))
+        for aw, _idx in parsed:
+            works.append((aw.aweme_id, aw.desc))
+            if len(works) >= settings["recent_works"]:
+                break
         total = 0
         for pid, desc in works:
             with get_session() as s:
@@ -3020,10 +3541,58 @@ class MonitorEngine:
                         "avatar_thumb": {"url_list": [author_dict["avatar"]]}}
                        if author_dict else None)
 
+    # ── TikTok 评论监控(浏览器拦截 /api/comment/list)──
+    async def _cw_tiktok_video(self, watch_id, identity, aweme_id, name, first_scan):
+        cfg = self.cfg.engine
+        settings = self._comment_watch_settings(watch_id)
+        with get_session() as s:
+            known = set(s.exec(select(CommentRecord.comment_id)
+                               .where(CommentRecord.watch_id == watch_id)
+                               .where(CommentRecord.aweme_id == aweme_id)).all())
+        raw, err = await fetch_tiktok_comments(
+            self.browser, identity, aweme_id, known,
+            max_scrolls=settings["max_scrolls"],
+            block_media=cfg.block_media_resources)
+        if err:
+            log.info("评论监控(TikTok 视频)%s: %s", aweme_id, err)
+        fresh = [c for c in (parse_tiktok_comment(rc) for rc in raw) if c]
+        n = await self._ingest(watch_id, aweme_id, fresh, name, name, first_scan,
+                               platform="tiktok")
+        return n, None
+
+    async def _cw_tiktok_user(self, watch_id, identity, handle, name, first_scan):
+        """账号型:抓取近期作品后逐个抓评论。handle 存于 sec_uid 字段。"""
+        cfg = self.cfg.engine
+        settings = self._comment_watch_settings(watch_id)
+        items, author, err = await fetch_tiktok_works(
+            self.browser, identity, handle, set(), max_scrolls=4,
+            block_media=cfg.block_media_resources)
+        if err:
+            log.info("评论监控(TikTok 账号)%s: %s", handle, err)
+        works = []
+        parsed = []
+        for idx, feed in enumerate(items):
+            aw = norm_tiktok_work(feed) if isinstance(feed, dict) else None
+            if aw:
+                parsed.append((aw, idx))
+        # 主页可能把置顶/老作品排在前面:按发布时间倒序取最近 N 个。
+        parsed.sort(key=lambda r: (-r[0].get("create_time") or 0, r[1]))
+        for aw, _idx in parsed:
+            works.append((aw["item_id"], aw.get("desc") or ""))
+            if len(works) >= settings["recent_works"]:
+                break
+        total = 0
+        for aid, desc in works:
+            n, _ = await self._cw_tiktok_video(
+                watch_id, identity, aid, name, first_scan)
+            total += n
+        return total, None
+
     async def _cw_creator(self, watch_id, identity, has_creator, name, first_scan):
         if not has_creator:
+            msg = "创作中心模式需要绑定已完成「创作者登录」的账号"
             log.warning("评论监控 %s 选创作中心,但账号无创作者登录态", watch_id)
-            return 0, None
+            raise RuntimeError(msg)
         cfg = self.cfg.engine
         settings = self._comment_watch_settings(watch_id)
         with get_session() as s:
@@ -3039,8 +3608,11 @@ class MonitorEngine:
         if err:
             log.info("评论监控(创作中心): %s", err)
         fresh = [c for c in (parse_creator_comment(rc) for rc in raw) if c]
+        fresh = [c for c in fresh if _comment_keep(c)]
         if not fresh:
-            return 0, None
+            # 零抓取的真实原因(页面改版/无响应结构等)必须返回给调用方,
+            # 否则「立即抓取」只提示新增 0 条,用户无法知道为什么。
+            return 0, None, err
         with get_session() as s:
             for c in fresh:
                 s.add(CommentRecord(watch_id=watch_id, **c))   # c 自带 aweme_id
@@ -3048,7 +3620,7 @@ class MonitorEngine:
         newer = [c for c in fresh if c["create_time"] > prev_max]
         if not first_scan and newer:
             await self._notify_comments(name, "(创作中心)", newer)
-        return len(fresh), None
+        return len(fresh), None, err
 
     # ── 小红书评论监控(浏览器优先，签名 API 仅显式兼容)──
     def _xhs_client(self, identity, state: str, proxy: str = ""):
@@ -3140,9 +3712,9 @@ class MonitorEngine:
                 log.info("评论监控(小红书创作者)%s: %s", user_id, e)
                 briefs_raw, author = [], None
         briefs = [b for b in (parse_note_brief(r) for r in briefs_raw) if b]
-        cutoff = int(time.time()) - settings["recent_days"] * 86400
-        briefs = [b for b in briefs
-                  if not b.get("create_time") or b["create_time"] >= cutoff]
+        # 评论监控抓取评论,不按作品发布时间过滤(旧笔记的新评论也要收);
+        # 仍按发布时间倒序取最近 N 篇,保证新笔记优先。
+        briefs.sort(key=lambda b: -(int(b.get("create_time") or 0)))
         briefs = briefs[:settings["recent_works"]]
         total = 0
         for index, b in enumerate(briefs):
@@ -3268,7 +3840,7 @@ class MonitorEngine:
         for tid in due:
             await self.publish_task(tid)
 
-    async def publish_task(self, task_id: int) -> dict:
+    async def publish_task(self, task_id: int, *, manual: bool = False) -> dict:
         if task_id in self._publishing:
             return {"ok": False, "error": "正在发布中"}
         self._publishing.add(task_id)
@@ -3276,12 +3848,22 @@ class MonitorEngine:
             with get_session() as s:
                 t = s.get(PublishTask, task_id)
                 account_id = t.account_id if t else None
+            wait_timeout = None
+            if manual and account_id:
+                self.request_manual_priority(account_id)
+                wait_timeout = self.cfg.engine.manual_lock_wait_seconds
             # 发布串行 + 该账号串行(有头浏览器会接管该账号 profile,不能与抓取并发)
             async with self._publish_sem:
-                async with self._operation_guard(
-                        account_id, OperationKind.PUBLISH,
-                        fallback_key=f"pub:{task_id}"):
-                    return await self._publish_task_locked(task_id)
+                try:
+                    async with self._operation_guard(
+                            account_id, OperationKind.PUBLISH,
+                            fallback_key=f"pub:{task_id}",
+                            acquire_timeout=wait_timeout,
+                            operation_label=("人工发布" if manual else "")):
+                        return await self._publish_task_locked(task_id)
+                finally:
+                    if manual:
+                        self._clear_manual_priority(account_id)
         except AccountUnavailableError:
             return self._fail_missing_account_task(PublishTask, task_id)
         finally:
@@ -3406,6 +3988,30 @@ class MonitorEngine:
                 ok, url, err = False, "", f"发布异常: {e!r}"
             return await self._finish_publish(task_id, ok, url, err, platform="douyin")
 
+        if platform == "tiktok":
+            # TikTok 发布:创作者中心英文页浏览器自动化,登录态在账号持久 profile。
+            # 只点一次 Post;on_submit 在点击前落 write_submitted 标记,
+            # 之后断连/超时一律「待确认」,平台侧最多一条。
+            if not state:
+                return await self._finish_publish(
+                    task_id, False, "", "该 TikTok 账号未完成登录,请先在账号页完成网页登录")
+            try:
+                ok, url, err = await publish_tiktok(
+                    self.browser, identity, state,
+                    media_type, title, desc, files,
+                    topics=topics, visibility=visibility,
+                    allow_save=allow_save, headed=True,
+                    on_submit=lambda: self._mark_write_submit(
+                        PublishTask, task_id, channel="browser"))
+            except asyncio.CancelledError:
+                await self._finish_publish(
+                    task_id, False, "", "write_uncertain:发布已中断，结果需到平台核对",
+                    platform="tiktok")
+                raise
+            except Exception as e:
+                ok, url, err = False, "", f"发布异常: {e!r}"
+            return await self._finish_publish(task_id, ok, url, err, platform="tiktok")
+
         if not state:
             return await self._finish_publish(
                 task_id, False, "", "该账号未完成小红书「创作者登录」,请先在账号页点「创作者登录」")
@@ -3454,11 +4060,13 @@ class MonitorEngine:
                     account_id, OperationKind.PUBLISH, platform_error)
         with get_session() as s:
             t = s.get(PublishTask, task_id)
+            retried = False
             if t:
                 account_id = t.account_id
                 if ok:
                     t.status = "done"
                     t.done_at = datetime.utcnow()
+                    t.retry_count = 0
                 elif uncertain:
                     # Submission crossed the click/POST boundary but success evidence
                     # was lost.  Never enqueue it again automatically.
@@ -3469,10 +4077,15 @@ class MonitorEngine:
                         RiskCategory.RISK, RiskCategory.NETWORK, RiskCategory.AUTH}:
                     self._defer_row(t, err, failure.next_allowed_at,
                                     signal=failure.signal)
+                elif self._schedule_transient_retry(
+                        t, err, manual=False, keep_schedule=True):
+                    # 仅提交前的浏览器/网络瞬时故障才会到这里;已点击提交的
+                    # 都被 uncertain 拦截,不存在重复发布。
+                    retried = True
                 else:
                     t.status = "failed"
                 t.result_url = url or t.result_url
-                t.error = "" if ok else err
+                t.error = "" if ok else (t.error if retried else err)
                 s.add(t); s.commit()
         if ok and account_id:
             self.risk.record_success(account_id, OperationKind.PUBLISH)
@@ -3483,8 +4096,7 @@ class MonitorEngine:
                                    .where(NotificationChannel.enabled == True)).all()  # noqa: E712
                     channels = [{"type": c.type, "config": _loads(c.config)} for c in chans]
                 if channels:
-                    pname = {"kuaishou": "快手", "douyin": "抖音",
-                             "shipinhao": "视频号"}.get(platform, "小红书")
+                    pname = platforms.label_of(platform, "小红书")
                     await notify_all(channels, f"{pname}发布成功", url or "已发布一条作品")
             except Exception:
                 pass
@@ -3560,24 +4172,30 @@ class MonitorEngine:
         last = max([d for d in rows if d] or [None])
         return last is None or (datetime.utcnow() - last).total_seconds() >= gap
 
-    def _comment_gate_error(self, account_id) -> str:
+    def _comment_gate_error(self, account_id, *, manual: bool = False) -> str:
         """Return the reason a comment write must remain queued.
 
         This is deliberately checked again inside the account lock.  The
         scheduler check is only an optimization; API-triggered ``run-now``
         and concurrent callers must go through the same gate.
+
+        manual=True(界面点「立即发送」)绕过所有自动门槛(暂停/验证/冷却/
+        活跃时段/间隔/配额),仅保留登录态和代理两个物理硬门槛。
         """
-        pause_error = self._write_pause_error(account_id)
-        if pause_error:
-            return pause_error
-        if not self._in_active_window(account_id):
-            return "当前处于非活跃时段，评论任务已保留在队列"
-        hcap = self.cfg.engine.comment_hourly_cap_per_account
-        if hcap > 0 and self._acct_hour_comment_count(account_id) >= hcap:
-            return "已达到账号每小时评论上限"
-        if not self._acct_gap_ok(account_id):
-            return "尚未达到账号评论最小间隔"
-        decision = self.risk.preflight(account_id, OperationKind.COMMENT)
+        if not manual:
+            pause_error = self._write_pause_error(account_id)
+            if pause_error:
+                return pause_error
+        if not manual:
+            if not self._in_active_window(account_id):
+                return "当前处于非活跃时段，评论任务已保留在队列"
+            hcap = self.cfg.engine.comment_hourly_cap_per_account
+            if hcap > 0 and self._acct_hour_comment_count(account_id) >= hcap:
+                return "已达到账号每小时评论上限"
+            if not self._acct_gap_ok(account_id):
+                return "尚未达到账号评论最小间隔"
+        decision = self.risk.preflight(
+            account_id, OperationKind.COMMENT, manual_write=manual)
         if not decision.allowed:
             return decision.reason
         return ""
@@ -3616,8 +4234,13 @@ class MonitorEngine:
                 r.last_error = error
                 s.add(r); s.commit()
 
-    async def run_comment_rule(self, rule_id: int) -> dict:
-        """跑一轮规则:发现目标 -> 去重/过滤 -> 生成 CommentTask(错峰排期)。"""
+    async def run_comment_rule(self, rule_id: int, manual: bool = False) -> dict:
+        """跑一轮规则:发现目标 -> 去重/过滤 -> 生成 CommentTask(错峰排期)。
+
+        manual=True 为用户在界面点「试跑」:发现阶段按交互读处理,可越过
+        最小操作间隔/操作抖动等软节奏;硬风控(冷却/退避/人工验证/登录态/代理)
+        一律保留。定时调度必须保持 manual=False。
+        """
         with get_session() as s:
             r = s.get(CommentRule, rule_id)
             if not r:
@@ -3633,6 +4256,8 @@ class MonitorEngine:
             use_ai = bool(r.use_ai)
             acc = s.get(DouyinAccount, r.account_id) if r.account_id else None
             rf["account_uid"] = acc.uid if acc else ""
+            rf["account_ua"] = (acc.ua or "") if acc else ""
+            rf["account_handle"] = (acc.douyin_id or "") if acc else ""
             rf["has_creator"] = bool(acc and acc.creator_storage_state)
             if acc and acc.status == "invalid":
                 self._mark_rule(rule_id, "账号登录态已失效")
@@ -3640,7 +4265,11 @@ class MonitorEngine:
             if acc and self._proxy_bad(acc):
                 self._mark_rule(rule_id, "账号代理标记为不可用(proxy bad),已跳过")
                 return {"ok": False, "error": "proxy bad"}
-            acc_state = acc.storage_state if acc else ""
+            # 与「我的作品」同步/抓评论一致:storage_state 为空时回退
+            # creator_storage_state,否则仅有创作者登录态的账号提取不到
+            # cookie,签名 API 通道被跳过而落入浏览器拦截(B 类机器零抓取)。
+            acc_state = ((acc.storage_state or acc.creator_storage_state or "")
+                         if acc else "")
             acc_proxy = acc.proxy if acc else ""
             acc_sec_uid = acc.sec_uid if acc else ""
             acc_nick = acc.nickname if acc else ""
@@ -3670,7 +4299,8 @@ class MonitorEngine:
         ai = self._ai_settings() if use_ai else None
 
         read_decision = self.risk.preflight(
-            rf["account_id"], OperationKind.READ_HEAVY)
+            rf["account_id"], OperationKind.READ_HEAVY,
+            interactive_read=manual)
         if not read_decision.allowed:
             return {"ok": False, "error": read_decision.reason,
                     "skipped": True,
@@ -3680,13 +4310,15 @@ class MonitorEngine:
                 rf["account_id"], OperationKind.READ_HEAVY,
                 fallback_key=f"rule:{rule_id}"):
             read_decision = self.risk.preflight(
-                rf["account_id"], OperationKind.READ_HEAVY)
+                rf["account_id"], OperationKind.READ_HEAVY,
+                interactive_read=manual)
             if not read_decision.allowed:
                 return {"ok": False, "error": read_decision.reason,
                         "skipped": True,
                         "next_allowed_at": (
                             read_decision.next_allowed_at.isoformat()
                             if read_decision.next_allowed_at else None)}
+            rf["manual"] = manual
             try:
                 cands, error = await self._discover_targets(
                     rf, acc_state, acc_proxy, acc_sec_uid, acc_nick, identity)
@@ -3714,15 +4346,20 @@ class MonitorEngine:
 
         # 过滤 + 去重 + 生成
         created = 0
+        revived = 0
         with get_session() as s:
-            existing = set()
-            for row in s.exec(select(CommentTask.aweme_id, CommentTask.target_comment_id)
+            # 同规则下每目标仅一条任务;failed 任务可被后续轮次复活复用,其余状态去重跳过
+            existing_rows = {}
+            for row in s.exec(select(CommentTask)
                               .where(CommentTask.rule_id == rule_id)).all():
-                existing.add((row[0], row[1]))
-            # 单列 select:exec().all() 直接返回标量(同 known= 查询的写法),勿用 (a,) 解包
+                existing_rows[(row.aweme_id, row.target_comment_id)] = row
+            # auto_comment:同账号不在同一作品下重复评论。只认「确实发过(done)」
+            # 与「可能已发出(uncertain)」；failed/canceled/draft 不永久封死作品，
+            # 否则一次失败会让该作品的评论永远不再生成任务。
             acct_commented = set(s.exec(
                 select(CommentTask.aweme_id)
-                .where(CommentTask.account_id == rf["account_id"])).all())
+                .where(CommentTask.account_id == rf["account_id"])
+                .where(CommentTask.status.in_(["done", "uncertain"]))).all())
             remain = min(rf["max_per_run"],
                          max(0, rf["daily_cap"] - self._rule_today_count(s, rule_id)))
             cap = self.cfg.engine.comment_daily_cap_per_account
@@ -3740,11 +4377,13 @@ class MonitorEngine:
                     skip["cap"] += 1
                     continue
                 key = (c["aweme_id"], c.get("target_comment_id", ""))
-                if key in existing:
+                # auto_comment:同账号不在同一作品下重复评论(跨规则也认)
+                if rf["mode"] == "auto_comment" and c["aweme_id"] in acct_commented:
                     skip["dup"] += 1
                     continue
-                # auto_comment:同账号不在同一作品下重复评论
-                if rf["mode"] == "auto_comment" and c["aweme_id"] in acct_commented:
+                old = existing_rows.get(key)
+                if old is not None and old.status != "failed":
+                    # pending/doing/done/uncertain/draft/canceled:不重复生成
                     skip["dup"] += 1
                     continue
                 text_blob = (c.get("source_text", "") or "")
@@ -3780,16 +4419,43 @@ class MonitorEngine:
                 # 小红书默认先生成草稿,人工通过后由队列自动发布;
                 # manual 模式则始终只保留草稿,不调用签名直连评论接口。
                 status = "draft" if (review_required or xhs_manual_only) else "pending"
-                s.add(CommentTask(
-                    platform=rf["platform"], rule_id=rule_id, account_id=rf["account_id"],
-                    aweme_id=c["aweme_id"], xsec_token=c.get("xsec_token", ""),
-                    target_comment_id=c.get("target_comment_id", ""),
-                    target_nick=c.get("target_nick", ""),
-                    target_text=(c.get("source_text", "") or "")[:200],
-                    content=content,
-                    method="manual" if xhs_manual_only else "",
-                    scheduled_at=sched, status=status))
-                existing.add(key)
+                if old is not None and old.status == "failed":
+                    # 复活此前失败的任务:清掉错误/节流痕迹重新排队(硬风控由执行时网关把关)
+                    old.platform = rf["platform"]
+                    old.account_id = rf["account_id"]
+                    old.xsec_token = c.get("xsec_token", "")
+                    old.work_title = c.get("work_title", "") or ""
+                    old.target_nick = c.get("target_nick", "")
+                    old.target_text = text_blob[:200]
+                    old.content = content
+                    old.method = "manual" if xhs_manual_only else ""
+                    old.status = status
+                    old.result = ""
+                    old.error = ""
+                    old.blocked_reason = ""
+                    old.blocked_signal = ""
+                    old.blocked_operation = ""
+                    old.blocked_at = None
+                    old.next_allowed_at = None
+                    old.done_at = None
+                    old.retry_count = 0  # 新一轮规则观察,瞬时失败计数清零
+                    old.scheduled_at = sched
+                    s.add(old)
+                    existing_rows[key] = old
+                    revived += 1
+                else:
+                    task_row = CommentTask(
+                        platform=rf["platform"], rule_id=rule_id, account_id=rf["account_id"],
+                        aweme_id=c["aweme_id"], work_title=c.get("work_title", "") or "",
+                        xsec_token=c.get("xsec_token", ""),
+                        target_comment_id=c.get("target_comment_id", ""),
+                        target_nick=c.get("target_nick", ""),
+                        target_text=text_blob[:200],
+                        content=content,
+                        method="manual" if xhs_manual_only else "",
+                        scheduled_at=sched, status=status)
+                    s.add(task_row)
+                    existing_rows[key] = task_row
                 acct_commented.add(c["aweme_id"])
                 created += 1
 
@@ -3805,6 +4471,10 @@ class MonitorEngine:
                 parts.append(f'{skip["empty"]}条文案渲染为空')
             if skip["cap"]:
                 parts.append(f'{skip["cap"]}条超出本轮上限/每日上限')
+            # 发现阶段返回的非硬性错误(如登录墙/接口无数据)必须透传,
+            # 否则前端只会显示「可能都已生成过」,真实原因被吞掉
+            if not cands and error and not parts:
+                parts.append(str(error))
             note = ";".join(parts)
 
             r = s.get(CommentRule, rule_id)
@@ -3820,9 +4490,10 @@ class MonitorEngine:
                     r.last_error = ""
                 s.add(r)
             s.commit()
-        log.info("自动评论规则 %s:发现 %s 候选,生成 %s 条任务 (skip=%s)",
-                 rule_id, len(cands), created, skip)
-        return {"ok": True, "created": created, "candidates": len(cands),
+        log.info("自动评论规则 %s:发现 %s 候选,生成 %s 条任务(复活失败任务 %s 条, skip=%s)",
+                 rule_id, len(cands), created, revived, skip)
+        return {"ok": True, "created": created, "revived": revived,
+                "candidates": len(cands),
                 "skipped": skip, "note": note, "error": error,
                 "review": review_required or xhs_manual_only,
                 "manual_only": xhs_manual_only}
@@ -3850,6 +4521,99 @@ class MonitorEngine:
                 or user.get("nickname") or user.get("name") or "")
         return bool(acc_nick and nick == acc_nick)
 
+    def _dy_read_client(self, state: str, ua: str, proxy: str, identity):
+        """评论监控同款签名 Web API 读取通道(cookie 直连,不过浏览器)。
+        douyin_read_mode=browser 或无 cookie 时返回 None,调用方回退浏览器抓取。"""
+        if self.cfg.engine.douyin_read_mode not in {"api", "hybrid"}:
+            return None
+        cookie = dy_cookie_from_state(state or "")
+        if not cookie:
+            return None
+        return DouyinClient(
+            cookie, ua or self.cfg.engine.user_agent,
+            timeout=self.cfg.engine.request_timeout_seconds,
+            proxy=proxy or "",
+            **douyin_client_environment(identity))
+
+    async def _dy_discover_works(self, client, identity, sec_uid: str):
+        """作品发现与评论监控同一通道:API 优先,hybrid 空响应回退浏览器。
+        返回 (items, error)——B 类机器浏览器拦截不到主页数据时 API 仍能取到。"""
+        cfg = self.cfg.engine
+        items, err = [], ""
+        if client is not None:
+            try:
+                async with client.session_scope():
+                    items = await client.fetch_all_video_list(sec_uid)
+                if not items:
+                    err = client.last_error or "empty_response"
+            except Exception as exc:
+                err = f"api:{type(exc).__name__}"
+            if items or cfg.douyin_read_mode == "api":
+                return items, err
+        if cfg.douyin_read_mode == "api":
+            return [], err or "douyin_api_works:no_cookie"
+        items, _author, browser_err = await fetch_videos(
+            self.browser, identity, sec_uid, set(), max_scrolls=4,
+            block_media=cfg.block_media_resources)
+        return items, (browser_err or err)
+
+    async def _dy_fetch_work_comments(self, client, identity, aweme_id: str,
+                                      xsec_token: str = "", *,
+                                      max_pages: int = 30,
+                                      with_replies: bool = True,
+                                      latest_pages: int = 0):
+        """单作品评论读取与评论监控同一通道:API 优先,hybrid 回退浏览器。
+        非空响应即使全是已知评论也代表 API 成功,不再重复打开浏览器。
+
+        发现自动回复目标时传 max_pages 小量 + with_replies=False +
+        latest_pages>0:只拉一级评论(子评论写链路定位不到,发现侧已过滤),
+        默认热度页外加拉少量"最新"页合并——新评论在热度序里沉底,这正是
+        "刚给作品加了评论但试跑抓不到"的原因;同时把每作品 30 页+回复扇出
+        的网络量(多作品试跑约 70s)降到个位数请求。"""
+        cfg = self.cfg.engine
+        if client is not None:
+            err = ""
+            raw: list = []
+            try:
+                async with client.session_scope():
+                    raw = await client.fetch_all_comments(
+                        aweme_id, max_pages=max_pages,
+                        with_replies=with_replies)
+                    if latest_pages > 0:
+                        # 最新序(sort_type=2)。平台忽略该参数时返回的仍是
+                        # 同一热度序列→去重无副作用;该分支报错也不影响主
+                        # 结果、不触发浏览器回退。
+                        try:
+                            fresh = await client.fetch_all_comments(
+                                aweme_id, max_pages=latest_pages,
+                                with_replies=False, sort_type=2)
+                            seen = {str(c.get("cid")
+                                        or c.get("comment_id") or "")
+                                    for c in raw}
+                            for c in fresh or []:
+                                key = str(c.get("cid")
+                                          or c.get("comment_id") or "")
+                                if key and key not in seen:
+                                    raw.append(c)
+                                    seen.add(key)
+                        except Exception:
+                            pass
+                if raw or not client.last_error:
+                    return raw, ""
+                err = client.last_error or "empty_response"
+            except Exception as exc:
+                err = f"api:{type(exc).__name__}"
+            if cfg.douyin_read_mode == "api":
+                return [], err
+        elif cfg.douyin_read_mode == "api":
+            return [], "douyin_api_comments:no_cookie"
+        raw, browser_err = await fetch_comments(
+            self.browser, identity, aweme_id, set(),
+            max_scrolls=cfg.comment_max_scrolls,
+            block_media=cfg.block_media_resources,
+            xsec_token=xsec_token)
+        return raw, browser_err
+
     async def _discover_targets(self, rf, state, proxy, acc_sec_uid, acc_nick, identity):
         """按规则模式发现可评论目标。返回 (candidates, error)。
         candidate: {aweme_id, xsec_token, target_comment_id, target_nick, ctx, source_text}"""
@@ -3861,18 +4625,37 @@ class MonitorEngine:
             if client is None:
                 return [], "账号登录态缺少 a1,请重新扫码登录"
             if mode == "auto_comment":
+                # 窗口跟随规则的每轮上限(每篇笔记一条任务)
+                works_limit = max(self.cfg.engine.comment_recent_works,
+                                  int(rf.get("max_per_run") or 0))
+                # 试跑(manual)时不按发布时间过滤
+                if rf.get("manual"):
+                    cutoff = 0
+                else:
+                    cutoff = int(time.time()) - max(0, self.cfg.engine.comment_recent_days) * 86400
+                briefs = []
                 if kind == "keyword":
-                    raw = await client.search_notes(rf["keyword"])
+                    # 搜索结果保持相关度顺序,仅扩大取用窗口
+                    for it in await client.search_notes(rf["keyword"]):
+                        b = parse_note_brief(it)
+                        if b:
+                            briefs.append(b)
                 else:   # creator
                     d = await client.notes_by_creator(rf["sec_uid"], xsec_token=rf["xsec_token"])
-                    raw = d.get("notes") or []
-                for it in raw:
-                    b = parse_note_brief(it)
-                    if not b:
+                    for it in (d.get("notes") or []):
+                        b = parse_note_brief(it)
+                        if b:
+                            briefs.append(b)
+                    # 博主主页按发布时间倒序,置顶/老笔记不再挤掉最新笔记
+                    briefs.sort(key=lambda b: -(int(b.get("create_time") or 0)))
+                for b in briefs[:max(0, works_limit)]:
+                    ct = int(b.get("create_time") or 0)
+                    if kind == "creator" and cutoff and ct and ct < cutoff:
                         continue
                     cands.append({"aweme_id": b["note_id"],
                                   "xsec_token": b.get("xsec_token", ""),
                                   "target_comment_id": "", "target_nick": "",
+                                  "work_title": b.get("title", ""),
                                   "ctx": {"kw": rf["keyword"]},
                                   "source_text": b.get("title", "")})
             else:   # auto_reply:回复自己作品的评论
@@ -3885,7 +4668,8 @@ class MonitorEngine:
                         b = parse_note_brief(it)
                         if b:
                             notes.append({"note_id": b["note_id"],
-                                          "xsec_token": b.get("xsec_token", "")})
+                                          "xsec_token": b.get("xsec_token", ""),
+                                          "title": b.get("title", "")})
                 for nt in notes:
                     try:
                         d = await client.note_comments(nt["note_id"], xsec_token=nt["xsec_token"])
@@ -3909,6 +4693,7 @@ class MonitorEngine:
                                       "xsec_token": nt["xsec_token"],
                                       "target_comment_id": c["comment_id"],
                                       "target_nick": c.get("user_nickname", ""),
+                                      "work_title": nt.get("title", ""),
                                       "ctx": {"nick": c.get("user_nickname", "")},
                                       "source_text": c.get("text", "")})
             return cands, ""
@@ -3920,12 +4705,28 @@ class MonitorEngine:
                 items, _author, err = await fetch_ks_videos(
                     self.browser, identity, rf["sec_uid"], set(), max_scrolls=4,
                     block_media=self.cfg.engine.block_media_resources)
-                for feed in items[:self.cfg.engine.comment_recent_works]:
+                # 与抖音同理:按发布时间倒序取最新作品,窗口跟随每轮上限
+                works_limit = max(self.cfg.engine.comment_recent_works,
+                                  int(rf.get("max_per_run") or 0))
+                # 试跑(manual)时不按发布时间过滤
+                if rf.get("manual"):
+                    cutoff = 0
+                else:
+                    cutoff = int(time.time()) - max(0, self.cfg.engine.comment_recent_days) * 86400
+                aws = []
+                for idx, feed in enumerate(items or []):
                     aw = parse_ks_feed(feed)
                     if aw:
-                        cands.append({"aweme_id": aw.aweme_id, "xsec_token": "",
-                                      "target_comment_id": "", "target_nick": "",
-                                      "ctx": {}, "source_text": aw.desc})
+                        aws.append((aw, idx))
+                aws.sort(key=lambda r: (-r[0].create_time, r[1])
+                         if r[0].create_time else (1, r[1]))
+                for aw, _idx in aws[:max(0, works_limit)]:
+                    if cutoff and aw.create_time and aw.create_time < cutoff:
+                        continue
+                    cands.append({"aweme_id": aw.aweme_id, "xsec_token": "",
+                                  "target_comment_id": "", "target_nick": "",
+                                  "work_title": aw.desc or "",
+                                  "ctx": {}, "source_text": aw.desc})
                 return cands, err
             # auto_reply 快手:回复自己作品评论
             works = []
@@ -3938,11 +4739,12 @@ class MonitorEngine:
                 if err and classify_platform_error(err)[0] in {
                         RiskCategory.RISK, RiskCategory.AUTH, RiskCategory.NETWORK}:
                     return [], err
-                cutoff = int(time.time()) - max(0, self.cfg.engine.comment_recent_days) * 86400
-                for feed in items[:self.cfg.engine.comment_recent_works]:
-                    aw = parse_ks_feed(feed)
-                    if aw and (not cutoff or not aw.create_time or aw.create_time >= cutoff):
-                        works.append((aw.aweme_id, aw.desc))
+                # 自动回复关注评论时间,不限制作品发布时间
+                aws = [parse_ks_feed(f) for f in items]
+                aws = [a for a in aws if a]
+                aws.sort(key=lambda a: (-a.create_time if a.create_time else 1))
+                for aw in aws[:self.cfg.engine.comment_recent_works]:
+                    works.append((aw.aweme_id, aw.desc))
             for pid, _desc in works:
                 raw, comment_error = await fetch_ks_comments(
                     self.browser, identity, pid, set(),
@@ -3960,32 +4762,139 @@ class MonitorEngine:
                     cands.append({"aweme_id": pid, "xsec_token": "",
                                   "target_comment_id": c["comment_id"],
                                   "target_nick": c.get("user_nickname", ""),
+                                  "work_title": _desc or "",
                                   "ctx": {"nick": c.get("user_nickname", "")},
                                   "source_text": c.get("text", "")})
             return cands, ""
-        # ── 抖音:浏览器自动化(发现仍用拦截抓取)──
+        # ── TikTok:浏览器通道(作品列表 Task 5 / 评论列表 Task 7 同一抓取函数)──
+        if platform == "tiktok":
+            if mode == "auto_comment":
+                if kind == "keyword":
+                    return [], "TikTok 暂不支持关键词发现,请用「创作者」模式指定博主"
+                works_limit = max(self.cfg.engine.comment_recent_works,
+                                  int(rf.get("max_per_run") or 0))
+                items, works_err = await fetch_tiktok_works(
+                    self.browser, identity, rf["sec_uid"], set(),
+                    max_scrolls=4,
+                    block_media=self.cfg.engine.block_media_resources)
+                if works_err:
+                    return [], works_err
+                # 与抖音/快手同理:按发布时间倒序取最新作品,试跑不过滤时间
+                cutoff = 0 if rf.get("manual") else int(time.time()) - max(
+                    0, self.cfg.engine.comment_recent_days) * 86400
+                works = [w for w in (norm_tiktok_work(it) for it in items) if w]
+                works.sort(key=lambda w: -(int(w.get("create_time") or 0)))
+                for w in works[:max(0, works_limit)]:
+                    ct = int(w.get("create_time") or 0)
+                    if cutoff and ct and ct < cutoff:
+                        continue
+                    cands.append({"aweme_id": w["item_id"], "xsec_token": "",
+                                  "target_comment_id": "", "target_nick": "",
+                                  "work_title": w.get("desc", "") or "",
+                                  "ctx": {}, "source_text": w.get("desc", "")})
+                return cands, ""
+            # auto_reply:回复自己作品的评论(只回一级评论,子评论折叠定位不到)
+            works = []
+            if kind == "work" and rf["aweme_id"]:
+                works = [(rf["aweme_id"], "")]
+            else:
+                items, works_err = await fetch_tiktok_works(
+                    self.browser, identity, rf.get("account_handle", ""),
+                    set(), max_scrolls=4,
+                    block_media=self.cfg.engine.block_media_resources)
+                if works_err and classify_platform_error(works_err)[0] in {
+                        RiskCategory.RISK, RiskCategory.AUTH,
+                        RiskCategory.NETWORK}:
+                    return [], works_err
+                recent = [w for w in (norm_tiktok_work(it) for it in items) if w]
+                recent.sort(key=lambda w: -(int(w.get("create_time") or 0)))
+                for w in recent[:self.cfg.engine.comment_recent_works]:
+                    works.append((w["item_id"], w.get("desc", "") or ""))
+            # 定时正式跑只处理最近 N 天的新评论;试跑不过滤
+            reply_cutoff = 0 if rf.get("manual") else int(time.time()) - max(
+                0, self.cfg.engine.comment_recent_days) * 86400
+            for aid, _desc in works:
+                raw, comment_error = await fetch_tiktok_comments(
+                    self.browser, identity, aid, set(),
+                    max_scrolls=self.cfg.engine.comment_max_scrolls,
+                    block_media=self.cfg.engine.block_media_resources)
+                if comment_error and classify_platform_error(comment_error)[0] in {
+                        RiskCategory.RISK, RiskCategory.AUTH,
+                        RiskCategory.NETWORK}:
+                    return [], comment_error
+                for rc in raw:
+                    c = parse_tiktok_comment(rc)
+                    if not c or not c.get("comment_id"):
+                        continue
+                    # 只回复一级评论(子评论折叠在「View N replies」里,写链路
+                    # 无法保证定位),与抖音发现阶段同策略
+                    if c.get("reply_to"):
+                        continue
+                    if reply_cutoff:
+                        created_at = int(c.get("create_time") or 0)
+                        if created_at > 100_000_000_000:
+                            created_at //= 1000
+                        if created_at and created_at < reply_cutoff:
+                            continue
+                    if (c.get("user_sec_uid")
+                            and c["user_sec_uid"] == acc_sec_uid) \
+                            or (c.get("user_nickname")
+                                and c["user_nickname"] == acc_nick):
+                        continue   # 不回复自己
+                    cands.append({"aweme_id": aid, "xsec_token": "",
+                                  "target_comment_id": c["comment_id"],
+                                  "target_nick": c.get("user_nickname", ""),
+                                  "work_title": _desc or "",
+                                  "ctx": {"nick": c.get("user_nickname", "")},
+                                  "source_text": c.get("text", "")})
+            return cands, ""
+        # ── 抖音:发现与评论监控同一通道(签名 Web API 优先,hybrid 回退浏览器)──
         if mode == "auto_comment":
             if kind == "keyword":
                 return [], "抖音暂不支持关键词发现,请用「创作者」模式指定博主"
-            items, _author, err = await fetch_videos(
-                self.browser, identity, rf["sec_uid"], set(), max_scrolls=4,
-                block_media=self.cfg.engine.block_media_resources)
-            for it in items[:self.cfg.engine.comment_recent_works]:
+            client = self._dy_read_client(state, rf.get("account_ua", ""),
+                                          proxy, identity)
+            items, err = await self._dy_discover_works(
+                client, identity, rf["sec_uid"])
+            # 主页把置顶作品排在最前,直接截前 N 个会一直拿到老作品;
+            # 与 auto_reply/评论监控一致按发布时间倒序取最新作品。
+            # 窗口跟随规则的每轮上限(每作品一条任务),否则「每轮上限」
+            # 调大也只会在 comment_recent_works 个作品里打转。
+            # 试跑(manual)时不按发布时间过滤,让用户能看到目标作品和生成文案。
+            works_limit = max(self.cfg.engine.comment_recent_works,
+                              int(rf.get("max_per_run") or 0))
+            recent_days = 0 if rf.get("manual") else self.cfg.engine.comment_recent_days
+            for it in self._latest_work_items(
+                    items, works_limit, recent_days):
                 aid = str(it.get("aweme_id") or "")
                 if aid:
-                    cands.append({"aweme_id": aid, "xsec_token": "",
+                    cands.append({"aweme_id": aid,
+                                  "xsec_token": str(it.get("xsec_token") or ""),
                                   "target_comment_id": "", "target_nick": "",
+                                  "work_title": it.get("desc", "") or "",
                                   "ctx": {}, "source_text": it.get("desc", "")})
             return cands, err
-        # auto_reply 抖音:回复自己作品评论
-        if rf.get("has_creator"):
+        # auto_reply 抖音:回复自己作品评论。
+        # 主通道与「我的作品→抓取评论」一致:签名 Web API 发现作品并按作品
+        # 取评论,aweme_id 由所请求的作品天然确定,不依赖页面归因。
+        # 仅当无 cookie 无法直连 API 且账号有创作者登录态时,才回退创作
+        # 中心页面抓取(评论信封缺 item_id 时会整体无法按作品归因)。
+        client = self._dy_read_client(state, rf.get("account_ua", ""),
+                                      proxy, identity)
+        if client is None and rf.get("has_creator"):
             raw, creator_error = await fetch_creator_comments(
                 self.browser, identity, set(),
                 page_url=self.cfg.engine.creator_comment_url,
                 max_scrolls=max(1, min(self.cfg.engine.comment_max_scrolls, 4)),
                 block_media=self.cfg.engine.block_media_resources)
             selected_works = set()
-            comment_cutoff = int(time.time()) - max(0, self.cfg.engine.comment_recent_days) * 86400
+            # 定时正式跑只处理最近 N 天的新评论;试跑(manual)只用于验证「能否抓到」,
+            # 不按评论时间过滤,否则老作品下的评论全部被滤掉又表现为 0 目标。
+            if rf.get("manual"):
+                comment_cutoff = 0
+            else:
+                comment_cutoff = int(time.time()) - max(
+                    0, self.cfg.engine.comment_recent_days) * 86400
             for rc in raw:
                 c = parse_creator_comment(rc)
                 if not c or not c.get("comment_id") or not c.get("aweme_id"):
@@ -4007,43 +4916,66 @@ class MonitorEngine:
                 cands.append({"aweme_id": c["aweme_id"], "xsec_token": "",
                               "target_comment_id": c["comment_id"],
                               "target_nick": c.get("user_nickname", ""),
+                              "work_title": c.get("aweme_desc", "") or "",
                               "ctx": {"nick": c.get("user_nickname", "")},
                               "source_text": c.get("text", "")})
             return cands, creator_error
         works = []
         if rf["target_kind"] == "work" and rf["aweme_id"]:
-            works = [(rf["aweme_id"], "")]
+            works = [(rf["aweme_id"], "", rf.get("xsec_token", ""))]
         else:
-            items, _a, err = await fetch_videos(
-                self.browser, identity, acc_sec_uid, set(), max_scrolls=4,
-                block_media=self.cfg.engine.block_media_resources)
+            items, err = await self._dy_discover_works(client, identity, acc_sec_uid)
             if err and classify_platform_error(err)[0] in {
                     RiskCategory.RISK, RiskCategory.AUTH, RiskCategory.NETWORK}:
                 return [], err
-            cutoff = int(time.time()) - max(0, self.cfg.engine.comment_recent_days) * 86400
-            for it in items[:self.cfg.engine.comment_recent_works]:
+            # 自动回复关注评论时间,不限制作品发布时间(旧作品下的新评论也需回复)
+            recent = self._latest_work_items(
+                items, self.cfg.engine.comment_recent_works, 0)
+            for it in recent:
                 aid = str(it.get("aweme_id") or "")
-                create_time = int(it.get("create_time") or 0)
-                if aid and (not cutoff or not create_time or create_time >= cutoff):
-                    works.append((aid, it.get("desc", "")))
-        for aid, _desc in works:
-            raw, comment_error = await fetch_comments(
-                self.browser, identity, aid, set(),
-                max_scrolls=self.cfg.engine.comment_max_scrolls,
-                block_media=self.cfg.engine.block_media_resources)
+                if aid:
+                    works.append((aid, it.get("desc", ""),
+                                  str(it.get("xsec_token") or "")))
+        # 与原创作中心分支一致的评论时间过滤:定时正式跑只处理最近 N 天的
+        # 新评论;试跑(manual)不过滤,先验证「能否抓到」。
+        if rf.get("has_creator") and not rf.get("manual"):
+            reply_comment_cutoff = int(time.time()) - max(
+                0, self.cfg.engine.comment_recent_days) * 86400
+        else:
+            reply_comment_cutoff = 0
+        for aid, _desc, work_token in works:
+            # 发现目标只需要一级评论:2 页热度(40 条,覆盖置顶/高赞)+ 3 页
+            # 最新(60 条,覆盖刚发布的新评论),不拉子评论扇出。
+            raw, comment_error = await self._dy_fetch_work_comments(
+                client, identity, aid, work_token,
+                max_pages=2, with_replies=False, latest_pages=3)
             if comment_error and classify_platform_error(comment_error)[0] in {
                     RiskCategory.RISK, RiskCategory.AUTH, RiskCategory.NETWORK}:
                 return [], comment_error
             for rc in raw:
+                # 只回复一级评论:子评论(回复)在作品页默认折叠在「展开 N 条
+                # 回复」里,浏览器写链路定位不到(作品总共个位数顶层评论时
+                # 表现为滚 10 轮仍找不到目标)。一级评论覆盖绝大多数自动回复
+                # 场景;API 写通道虽能直接 reply 子评论,但浏览器/hybrid 回退
+                # 无法保证,统一只取一级避免任务注定失败。
+                if str(rc.get("reply_id") or "0") not in ("0", ""):
+                    continue
                 c = parse_comment(rc)
                 if not c or not c.get("comment_id"):
                     continue
+                if reply_comment_cutoff:
+                    created_at = int(c.get("create_time") or 0)
+                    if created_at > 100_000_000_000:
+                        created_at //= 1000
+                    if created_at and created_at < reply_comment_cutoff:
+                        continue
                 if self._is_self_comment(rc, acc_nick, acc_sec_uid,
                                          rf.get("account_uid", "")):
                     continue
-                cands.append({"aweme_id": aid, "xsec_token": "",
+                cands.append({"aweme_id": aid, "xsec_token": work_token,
                               "target_comment_id": c["comment_id"],
                               "target_nick": c.get("user_nickname", ""),
+                              "work_title": _desc or "",
                               "ctx": {"nick": c.get("user_nickname", "")},
                               "source_text": c.get("text", "")})
         return cands, ""
@@ -4104,19 +5036,26 @@ class MonitorEngine:
             return False
         return True
 
-    def _action_gate_error(self, account_id, gap: int, action: str = "follow") -> str:
-        """Apply the same write gate to queued and API-triggered actions."""
-        pause_error = self._write_pause_error(account_id)
-        if pause_error:
-            return pause_error
-        if not self._in_active_window(account_id):
-            return "当前处于非活跃时段，写操作已保留在队列"
-        if not self._action_cap_ok(account_id):
-            return "已达到账号写操作额度"
-        if not self._action_gap_ok(account_id, gap):
-            return "尚未达到账号写操作最小间隔"
+    def _action_gate_error(self, account_id, gap: int, action: str = "follow",
+                           *, manual: bool = False) -> str:
+        """Apply the same write gate to queued and API-triggered actions.
+
+        manual=True(客服坐席回投/界面立即执行)绕过所有自动门槛(暂停/验证/
+        冷却/活跃时段/间隔/配额),仅保留登录态和代理两个物理硬门槛。"""
+        if not manual:
+            pause_error = self._write_pause_error(account_id)
+            if pause_error:
+                return pause_error
+        if not manual:
+            if not self._in_active_window(account_id):
+                return "当前处于非活跃时段，写操作已保留在队列"
+            if not self._action_cap_ok(account_id):
+                return "已达到账号写操作额度"
+            if not self._action_gap_ok(account_id, gap):
+                return "尚未达到账号写操作最小间隔"
         kind = OperationKind.DM if action == "send_dm" else OperationKind.SOCIAL
-        decision = self.risk.preflight(account_id, kind)
+        decision = self.risk.preflight(
+            account_id, kind, manual_write=manual)
         if not decision.allowed:
             return decision.reason
         return ""
@@ -4143,7 +5082,7 @@ class MonitorEngine:
             except Exception as e:
                 log.warning("写操作任务 %s 执行异常: %s", tid, e)
 
-    async def execute_action_task(self, task_id: int) -> dict:
+    async def execute_action_task(self, task_id: int, *, manual: bool = False) -> dict:
         if task_id in self._actioning:
             return {"ok": False, "error": "正在执行中"}
         self._actioning.add(task_id)
@@ -4153,22 +5092,36 @@ class MonitorEngine:
                 account_id = t.account_id if t else None
                 kind = (OperationKind.DM if t and t.action == "send_dm"
                         else OperationKind.SOCIAL)
-            async with self._operation_guard(
-                    account_id, kind, fallback_key=f"act:{task_id}"):
-                return await self._execute_action_task_locked(task_id)
+            wait_timeout = None
+            if manual and account_id:
+                self.request_manual_priority(account_id)
+                wait_timeout = self.cfg.engine.manual_lock_wait_seconds
+            try:
+                async with self._operation_guard(
+                        account_id, kind, fallback_key=f"act:{task_id}",
+                        acquire_timeout=wait_timeout,
+                        operation_label=("人工操作" if manual else "")):
+                    return await self._execute_action_task_locked(task_id, manual=manual)
+            finally:
+                if manual:
+                    self._clear_manual_priority(account_id)
         except AccountUnavailableError:
             return self._fail_missing_account_task(AccountActionTask, task_id)
         finally:
             self._actioning.discard(task_id)
 
-    async def _execute_action_task_locked(self, task_id: int) -> dict:
+    async def _execute_action_task_locked(self, task_id: int, *,
+                                          manual: bool = False) -> dict:
         with get_session() as s:
             t = s.get(AccountActionTask, task_id)
             if not t or t.status != "pending":
                 return {"ok": False, "error": "任务不可执行"}
-            deferred = self._task_deferral(t)
-            if deferred:
-                return deferred
+            # 人工显式发送(客服坐席回投/界面立即执行):绕过所有自动门槛,
+            # 仅保留登录态和代理两个物理硬门槛。
+            if not manual:
+                deferred = self._task_deferral(t)
+                if deferred:
+                    return deferred
             account_id = t.account_id
             acc = s.get(DouyinAccount, t.account_id) if t.account_id else None
             if not acc:
@@ -4195,11 +5148,12 @@ class MonitorEngine:
                 s.add(t); s.commit()
                 return {"ok": False, "error": "account_invalid"}
             gate_error = self._action_gate_error(
-                t.account_id, t.min_gap_seconds, t.action)
+                t.account_id, t.min_gap_seconds, t.action, manual=manual)
             if gate_error:
                 kind = (OperationKind.DM if t.action == "send_dm"
                         else OperationKind.SOCIAL)
-                decision = self.risk.preflight(t.account_id, kind)
+                decision = self.risk.preflight(
+                    t.account_id, kind, manual_write=manual)
                 self._defer_row(t, gate_error, decision.next_allowed_at,
                                 signal=decision.signal)
                 s.add(t); s.commit()
@@ -4243,6 +5197,22 @@ class MonitorEngine:
 
         async def _browser_action() -> tuple[bool, str, str]:
             """Original page route; kept as the only hybrid fallback."""
+            if platform == "tiktok":
+                if action == "follow":
+                    ok, err = await follow_tiktok_browser(
+                        self.browser, identity, target_uid, target_sec_uid)
+                    return ok, err, "browser"
+                if action == "unfollow":
+                    ok, err = await follow_tiktok_browser(
+                        self.browser, identity, target_uid, target_sec_uid,
+                        unfollow=True)
+                    return ok, err, "browser"
+                if action == "send_dm":
+                    ok, err = await send_tiktok_dm(
+                        self.browser, identity, target_uid, target_sec_uid,
+                        content)
+                    return ok, err, "browser"
+                return False, f"未知动作 {action}", "browser"
             if action == "follow":
                 ok, err = await do_follow(self.browser, identity, platform,
                                           target_uid, target_sec_uid)
@@ -4479,9 +5449,11 @@ class MonitorEngine:
         with get_session() as s:
             t = s.get(AccountActionTask, task_id)
             account_id = t.account_id if t else None
+            retried = False
             if t:
                 if ok:
                     t.status = "done"
+                    t.retry_count = 0
                 elif uncertain:
                     t.status = "uncertain"
                     t.scheduled_at = None
@@ -4490,9 +5462,11 @@ class MonitorEngine:
                         RiskCategory.RISK, RiskCategory.NETWORK, RiskCategory.AUTH}:
                     self._defer_row(t, err, failure.next_allowed_at,
                                     signal=failure.signal)
+                elif self._schedule_transient_retry(t, err, manual=manual):
+                    retried = True
                 else:
                     t.status = "failed"
-                t.error = "" if ok else err
+                t.error = "" if ok else (t.error if retried else err)
                 t.result = "ok" if ok else ""
                 t.method = method
                 t.done_at = datetime.utcnow() if ok else t.done_at
@@ -4540,7 +5514,7 @@ class MonitorEngine:
             self.risk.record_success(account_id, kind)
         return {"ok": ok, "error": "" if ok else err, "method": method}
 
-    async def execute_comment_task(self, task_id: int) -> dict:
+    async def execute_comment_task(self, task_id: int, *, manual: bool = False) -> dict:
         if task_id in self._commenting:
             return {"ok": False, "error": "正在执行中"}
         self._commenting.add(task_id)
@@ -4548,29 +5522,43 @@ class MonitorEngine:
             with get_session() as s:
                 t = s.get(CommentTask, task_id)
                 account_id = t.account_id if t else None
-            async with self._operation_guard(
-                    account_id, OperationKind.COMMENT,
-                    fallback_key=f"cmt:{task_id}"):
-                return await self._execute_comment_task_locked(task_id)
+            wait_timeout = None
+            if manual and account_id:
+                # 人工“立即发”:通知同账号后台长采集在取消点让位,且等锁有界。
+                self.request_manual_priority(account_id)
+                wait_timeout = self.cfg.engine.manual_lock_wait_seconds
+            try:
+                async with self._operation_guard(
+                        account_id, OperationKind.COMMENT,
+                        fallback_key=f"cmt:{task_id}",
+                        acquire_timeout=wait_timeout,
+                        operation_label=("人工操作" if manual else "")):
+                    return await self._execute_comment_task_locked(task_id, manual=manual)
+            finally:
+                if manual:
+                    self._clear_manual_priority(account_id)
         except AccountUnavailableError:
             return self._fail_missing_account_task(CommentTask, task_id)
         finally:
             self._commenting.discard(task_id)
 
-    async def _execute_comment_task_locked(self, task_id: int) -> dict:
+    async def _execute_comment_task_locked(self, task_id: int,
+                                           manual: bool = False) -> dict:
         with get_session() as s:
             t = s.get(CommentTask, task_id)
             if not t:
                 return {"ok": False, "error": "任务不存在"}
             if t.status not in ("pending",):
                 return {"ok": False, "error": f"任务状态为 {t.status}"}
-            deferred = self._task_deferral(t)
+            # 人工「立即发送」不受上一次自动延期(next_allowed_at)约束
+            deferred = None if manual else self._task_deferral(t)
             if deferred:
                 return deferred
             account_id = t.account_id
-            # 执行前再查一次每日上限(生成到执行之间可能已超额)
+            # 执行前再查一次每日上限(生成到执行之间可能已超额);人工显式发送不拦
             cap = self.cfg.engine.comment_daily_cap_per_account
-            if cap > 0 and self._acct_today_count(s, t.account_id) >= cap:
+            if cap > 0 and not manual \
+                    and self._acct_today_count(s, t.account_id) >= cap:
                 self._defer_row(
                     t, "已达账号每日评论上限",
                     datetime.utcnow() + timedelta(days=1))
@@ -4607,9 +5595,10 @@ class MonitorEngine:
                 self._defer_row(t, "账号登录态已失效，等待重新登录", fallback_seconds=900)
                 s.add(t); s.commit()
                 return {"ok": False, "error": "account_invalid"}
-            gate_error = self._comment_gate_error(t.account_id)
+            gate_error = self._comment_gate_error(t.account_id, manual=manual)
             if gate_error:
-                decision = self.risk.preflight(t.account_id, OperationKind.COMMENT)
+                decision = self.risk.preflight(
+                    t.account_id, OperationKind.COMMENT, manual_write=manual)
                 self._defer_row(t, gate_error, decision.next_allowed_at,
                                 signal=decision.signal)
                 s.add(t); s.commit()
@@ -4673,6 +5662,22 @@ class MonitorEngine:
                     headed=(True if native_mode
                             else self.cfg.engine.comment_browser_headed))
                 result = "ok" if ok else ""
+            elif platform == "tiktok":
+                # 纯浏览器证据化写:三态(成功/失败/write_uncertain),
+                # on_submit 点击「Post」即落 submitted 标记防重发
+                method = "browser"
+                ok, err = await comment_tiktok_browser(
+                    self.browser, identity, aweme_id, content,
+                    reply_to_text=target_text if target_cid else "",
+                    target_nick=target_nick if target_cid else "",
+                    target_cid=target_cid,
+                    require_reply=bool(target_cid),
+                    headed=(True if native_mode
+                            else self.cfg.engine.comment_browser_headed),
+                    verify_wait_seconds=self.cfg.engine.tiktok_captcha_wait_seconds,
+                    on_submit=lambda: self._mark_write_submit(
+                        CommentTask, task_id))
+                result = "ok" if ok else ""
             elif platform == "douyin" and dy_write_mode in {"api", "hybrid"}:
                 method = "api"
                 cookie = dy_cookie_from_state(state)
@@ -4696,7 +5701,11 @@ class MonitorEngine:
                         reply_to_text=target_text if target_cid else "",
                         require_reply=bool(target_cid),
                         headed=(True if native_mode
-                                else self.cfg.engine.comment_browser_headed))
+                                else self.cfg.engine.comment_browser_headed),
+                        verify_wait_seconds=self.cfg.engine.douyin_captcha_wait_seconds,
+                        xsec_token=xsec_token,
+                        target_nick=target_nick if target_cid else "",
+                        target_cid=target_cid)
                     method = "browser_fallback"
                     result = "ok" if ok else ""
             else:
@@ -4706,7 +5715,11 @@ class MonitorEngine:
                     reply_to_text=target_text if target_cid else "",
                     require_reply=bool(target_cid),
                     headed=(True if native_mode
-                            else self.cfg.engine.comment_browser_headed))
+                            else self.cfg.engine.comment_browser_headed),
+                    verify_wait_seconds=self.cfg.engine.douyin_captcha_wait_seconds,
+                    xsec_token=xsec_token,
+                    target_nick=target_nick if target_cid else "",
+                    target_cid=target_cid)
                 result = "ok" if ok else ""
         except Exception as e:
             ok, err = False, (str(e) or repr(e))
@@ -4719,10 +5732,12 @@ class MonitorEngine:
         with get_session() as s:
             t = s.get(CommentTask, task_id)
             account_id = t.account_id if t else None
+            retried = False
             if t:
                 # “立即发”在 manual 模式下也只能回到草稿,不能变成失败后重试循环。
                 if ok:
                     t.status = "done"
+                    t.retry_count = 0
                 elif manual_only:
                     t.status = "draft"
                 elif uncertain:
@@ -4733,16 +5748,22 @@ class MonitorEngine:
                         RiskCategory.RISK, RiskCategory.NETWORK, RiskCategory.AUTH}:
                     self._defer_row(t, err, failure.next_allowed_at,
                                     signal=failure.signal)
+                elif self._schedule_transient_retry(t, err, manual=manual):
+                    retried = True
                 else:
                     t.status = "failed"
                 t.result = result
-                t.error = "" if ok else err
+                t.error = "" if ok else (t.error if retried else err)
                 t.method = method
                 t.done_at = datetime.utcnow() if ok else t.done_at
                 s.add(t); s.commit()
         if ok:
             self.risk.record_success(account_id, OperationKind.COMMENT)
             log.info("评论任务 %s 已发送(%s,作品 %s)", task_id, method, aweme_id)
+        elif retried:
+            log.info("评论任务 %s 瞬时失败,已排期自动重试(%s/%s): %s",
+                     task_id, t.retry_count if t else "?",
+                     self.cfg.engine.transient_retry_max, err)
         else:
             log.info("评论任务 %s 失败: %s", task_id, err)
         return {"ok": ok, "error": err, "method": method}

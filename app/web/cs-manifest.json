@@ -1,0 +1,25 @@
+{
+  "name": "CreatorHub 客服坐席",
+  "short_name": "客服坐席",
+  "description": "CreatorHub 多平台客服统一接待工作台",
+  "start_url": "/?panel=cs",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f4f4f6",
+  "theme_color": "#1d1d1f",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect width='192' height='192' rx='40' fill='%231d1d1f'/%3E%3Ctext x='96' y='120' text-anchor='middle' font-family='Arial,sans-serif' font-size='80' font-weight='800' fill='white'%3ECS%3C/text%3E%3C/svg%3E",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='100' fill='%231d1d1f'/%3E%3Ctext x='256' y='320' text-anchor='middle' font-family='Arial,sans-serif' font-size='200' font-weight='800' fill='white'%3ECS%3C/text%3E%3C/svg%3E",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

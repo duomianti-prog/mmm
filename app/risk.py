@@ -133,6 +133,20 @@ def classify_platform_error(
         return RiskCategory.NETWORK, "network_failure"
 
     text = str(error or "").strip().lower()
+
+    # Python 代码异常(如 UnicodeEncodeError/AttributeError)不是平台风控信号。
+    # 这类异常的错误文本可能恰好包含"验证"等词(例如 print 语句含"人工验证"
+    # 触发 UnicodeEncodeError),会被下面的 risk_markers 误判为 RISK 并设账号
+    # 级暂停。先识别并归类为 BUSINESS,避免代码 bug 连累健康账号。
+    if any(pat in text for pat in (
+            "unicodeencodeerror", "unicodedecodeerror", "attributeerror",
+            "typeerror", "valueerror", "keyerror", "indexerror",
+            "filenotfounderror", "permissionerror", "runtimeerror",
+            "nameerror", "importerror", "modulenotfounderror",
+            "encodingerror", "oserror", "ioerror",
+            )):
+        return RiskCategory.BUSINESS, "code_exception"
+
     # Browser interception failures used to include a list of possible causes,
     # for example "可能未登录/被风控/无结果".  Those messages are diagnostic
     # guesses, not evidence of an expired session.  Classifying them by a
@@ -490,6 +504,7 @@ class RiskController:
         now: datetime | None = None,
         allow_invalid_probe: bool = False,
         interactive_read: bool = False,
+        manual_write: bool = False,
     ) -> RiskDecision:
         if not self.policy.enabled:
             return RiskDecision(True)
@@ -501,6 +516,10 @@ class RiskController:
         # platform challenges, backoff, cooldown, recovery or session rests.
         interactive_read = interactive_read and kind in {
             OperationKind.READ_LIGHT, OperationKind.READ_HEAVY}
+        # 用户在界面显式点击「立即发送」的单次写操作:人为节奏即真人节奏,
+        # 可越过所有自动风控门槛(验证/退避/冷却/恢复期/活跃时段/配额/间隔)。
+        # 仅保留登录态失效和代理不可用两个物理硬门槛(没登录或没网确实发不了)。
+        manual_write = manual_write and kind in self._WRITE_KINDS
 
         with self._decision_lock, get_session() as session:
             account = self._load_account(session, account_or_id)
@@ -541,8 +560,12 @@ class RiskController:
                     now + timedelta(minutes=5),
                     "proxy_unavailable",
                 )
+            # manual_write=True:跳过单任务触发的门槛(manual_review/probe_only),
+            # 这些不应永久阻塞用户显式操作。但保留 cooldown(真实平台限流)
+            # 和 network_backoff(网络异常退避)——重试这些会加剧风控。
             state = self._state(session, account_id)
-            if state.manual_review_required and kind != OperationKind.LOGIN:
+            if state.manual_review_required and kind != OperationKind.LOGIN \
+                    and not manual_write:
                 return RiskDecision(
                     False, "平台要求人工验证；请在账号浏览器中处理后人工解除暂停",
                     signal="manual_review_required")
@@ -558,7 +581,8 @@ class RiskController:
                     "cooldown",
                 )
 
-            if state.risk_level > 0 and kind != OperationKind.READ_LIGHT:
+            if state.risk_level > 0 and kind != OperationKind.READ_LIGHT \
+                    and not manual_write:
                 next_at = state.probe_only_until or state.cooldown_until or now
                 return RiskDecision(
                     False,
@@ -574,7 +598,8 @@ class RiskController:
                 if next_probe > now:
                     return RiskDecision(False, "恢复探测间隔未到", next_probe, "probe_gap")
 
-            if kind in self._WRITE_KINDS and not self._in_active_window(account, now):
+            if (kind in self._WRITE_KINDS and not manual_write
+                    and not self._in_active_window(account, now)):
                 local = now.replace(tzinfo=timezone.utc).astimezone(self._timezone(account))
                 next_local = local.replace(
                     hour=max(0, min(23, self.cfg.engine.active_hours_start)),
@@ -587,25 +612,26 @@ class RiskController:
             gap, hourly_cap, daily_cap = self._limits(kind)
             kind_value = kind.value
             latest = self._latest_success(session, account_id, [kind_value])
-            if latest and gap > 0 and not interactive_read:
+            if latest and gap > 0 and not interactive_read and not manual_write:
                 next_at = latest + timedelta(seconds=gap)
                 if next_at > now:
                     return RiskDecision(False, "尚未达到该操作最小间隔", next_at, "kind_gap")
 
-            if kind in self._WRITE_KINDS and state.last_write_at:
+            if (kind in self._WRITE_KINDS and not manual_write
+                    and state.last_write_at):
                 next_at = state.last_write_at + timedelta(
                     seconds=self._shared_write_gap())
                 if next_at > now:
                     return RiskDecision(False, "尚未达到账号共享写操作间隔", next_at,
                                         "shared_write_gap")
 
-            if hourly_cap > 0:
+            if hourly_cap > 0 and not manual_write:
                 count = self._count_successes(
                     session, account_id, [kind_value], now - timedelta(hours=1))
                 if count >= hourly_cap:
                     return RiskDecision(False, "已达到账号每小时操作上限",
                                         now + timedelta(hours=1), "hourly_cap")
-            if daily_cap > 0:
+            if daily_cap > 0 and not manual_write:
                 day_start = self._local_day_start_utc(account, now)
                 count = self._count_successes(session, account_id, [kind_value], day_start)
                 if count >= daily_cap:
@@ -616,7 +642,8 @@ class RiskController:
                     return RiskDecision(False, "已达到账号每日操作上限", next_at,
                                         "daily_cap")
 
-            if kind in (OperationKind.SOCIAL, OperationKind.DM):
+            if (kind in (OperationKind.SOCIAL, OperationKind.DM)
+                    and not manual_write):
                 action_kinds = [OperationKind.SOCIAL.value, OperationKind.DM.value]
                 combined_hourly_cap, combined_daily_cap = self._combined_action_caps()
                 hour_count = self._count_successes(
@@ -641,6 +668,9 @@ class RiskController:
                     (state.operation_not_before, "账号操作节奏等待中", "operation_pacing"),
                 ):
                     if interactive_read and signal == "operation_pacing":
+                        continue
+                    # 人工显式触发的单次写操作不受会话休息/抖动节奏限制
+                    if manual_write:
                         continue
                     if deadline and deadline > now:
                         return RiskDecision(False, message, deadline, signal)

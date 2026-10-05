@@ -79,6 +79,8 @@ class DouyinAccount(SQLModel, table=True):
     exit_timezone: str = ""
     exit_proxy_signature: str = ""
     exit_checked_at: Optional[datetime] = None
+    # 账号级"要求出口地区"(ISO2,如 US);空=跟随全局允许/封禁列表。TikTok 硬闸门使用。
+    required_exit_country: str = ""
     last_active_at: Optional[datetime] = None  # 上次活跃(用于错峰调度)
     write_paused_until: Optional[datetime] = None  # 平台风控后暂停自动写操作
     write_pause_reason: str = ""                    # 最近一次暂停原因
@@ -326,10 +328,11 @@ class PublishTask(SQLModel, table=True):
     blocked_operation: str = ""
     blocked_at: Optional[datetime] = None
     next_allowed_at: Optional[datetime] = Field(default=None, index=True)
-    source_platform: str = ""      # 来源(如 douyin),跨平台转发时填
+    source_platform: str = ""      # 来源(如 douyin),跨平台作品转发时填
     source_content_id: Optional[int] = None            # 来源作品记录 id
     created_at: datetime = Field(default_factory=datetime.utcnow)
     done_at: Optional[datetime] = None
+    retry_count: int = 0           # 提交前瞬时失败(浏览器崩溃/断网)自动重试;已提交则 uncertain 不重试
 
 
 class CommentRecord(SQLModel, table=True):
@@ -352,7 +355,7 @@ class CommentRecord(SQLModel, table=True):
 class KeywordCollectionJob(SQLModel, table=True):
     """一次性的关键词批量采集任务。与持续轮询的 MonitorTarget 分开建模。"""
     id: Optional[int] = Field(default=None, primary_key=True)
-    platform: str = Field(default="douyin", index=True)  # douyin | xhs
+    platform: str = Field(default="douyin", index=True)  # douyin | xhs | tiktok
     account_id: int = Field(index=True)
     keywords: str = "[]"                 # JSON 字符串数组
     max_contents_per_keyword: int = 20
@@ -520,6 +523,7 @@ class CommentTask(SQLModel, table=True):
     rule_id: Optional[int] = Field(default=None, index=True)   # 来源规则(手动=None)
     account_id: Optional[int] = None
     aweme_id: str = Field(default="", index=True)         # 目标作品 / 笔记 note_id
+    work_title: str = ""                                   # 目标作品标题(展示用,缺省回退 aweme_id)
     xsec_token: str = ""                                  # 小红书:发评论所需令牌
     target_comment_id: str = ""                           # 非空=回复该条评论;空=作品下顶层评论
     target_nick: str = ""                                 # 被回复者昵称(供 {nick} 用)
@@ -538,6 +542,7 @@ class CommentTask(SQLModel, table=True):
     method: str = ""               # 实际走的通道:manual | api | browser
     created_at: datetime = Field(default_factory=datetime.utcnow)
     done_at: Optional[datetime] = None
+    retry_count: int = 0           # 瞬时失败(浏览器崩溃/超时/断网)自动重试次数,硬失败不重试
 
 
 # ─────────── 本账号管理(作品 / 关注 / 粉丝 / 私信)───────────
@@ -710,6 +715,7 @@ class AccountActionTask(SQLModel, table=True):
     min_gap_seconds: int = 60      # 同账号两次写操作最小间隔
     created_at: datetime = Field(default_factory=datetime.utcnow)
     done_at: Optional[datetime] = None
+    retry_count: int = 0           # 瞬时失败自动重试次数,硬失败不重试
 
 
 class ShareDownloadRecord(SQLModel, table=True):

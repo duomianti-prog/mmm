@@ -825,10 +825,18 @@ class DouyinClient:
 
     # ── 评论(直连 comment/list + reply,分页拉全量;参考 CommentAll)──
     async def fetch_comments_page(self, aweme_id: str, cursor: int = 0,
-                                  count: int = 20) -> dict:
+                                  count: int = 20,
+                                  sort_type: int = 0) -> dict:
+        params = {"aweme_id": aweme_id, "cursor": cursor, "count": count,
+                  "item_type": 0}
+        # sort_type=2:网页端"最新"排序(时间逆序)。不传=默认推荐/最热序,
+        # 新评论会沉在热度榜深处——发现链路需要它保证刚发布的评论被抓到。
+        # 平台若不识别会忽略该参数,不会报错。
+        if sort_type:
+            params["sort_type"] = int(sort_type)
         data = await self._get_json(
             "/aweme/v1/web/comment/list/",
-            {"aweme_id": aweme_id, "cursor": cursor, "count": count, "item_type": 0},
+            params,
             referer=f"{BASE}/video/{aweme_id}",
         )
         return data or {}
@@ -844,14 +852,17 @@ class DouyinClient:
         return data or {}
 
     async def fetch_all_comments(self, aweme_id: str, max_pages: int = 30,
-                                 with_replies: bool = True, max_reply_pages: int = 12
+                                 with_replies: bool = True, max_reply_pages: int = 12,
+                                 sort_type: int = 0
                                  ) -> List[dict]:
         """分页拉一条作品的全部一级评论;with_replies 时顺带把有回复的评论的子评论拉全。
-        返回原始评论项(含子评论)一维列表,交由上层 parse_comment 归一 + 去重。"""
+        sort_type 非 0 时按指定排序分页(如 2=最新);返回原始评论项(含子评论)
+        一维列表,交由上层 parse_comment 归一 + 去重。"""
         out: List[dict] = []
         cursor = 0
         for _ in range(max_pages):
-            page = await self.fetch_comments_page(aweme_id, cursor)
+            page = await self.fetch_comments_page(
+                aweme_id, cursor, sort_type=sort_type)
             comments = page.get("comments") or []
             out.extend(comments)
             if with_replies:

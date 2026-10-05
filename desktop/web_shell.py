@@ -91,12 +91,12 @@ class ShellHandler(BaseHTTPRequestHandler):
 def run_desktop(home, *, autostart=False, install_browser=True):
     import webview
     import pystray
-    from desktop.ui import brand_image
+    from desktop.ui import brand_image, BRAND_NAME
     lock = InstanceLock(home)
     controller = Controller(home, install_browser=install_browser)
     server = ShellServer(controller)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    window = webview.create_window("CreatorHub", server.origin, width=1100, height=800,
+    window = webview.create_window(BRAND_NAME, server.origin, width=1100, height=800,
                                   min_size=(740, 580), background_color="#f6f5f3", text_select=True)
     tray = None
     allow_close = threading.Event()
@@ -119,7 +119,7 @@ def run_desktop(home, *, autostart=False, install_browser=True):
     def hide():
         nonlocal tray
         if not tray:
-            tray = pystray.Icon("CreatorHub", brand_image(), "CreatorHub 启动中心", menu=pystray.Menu(
+            tray = pystray.Icon(BRAND_NAME, brand_image(), f"{BRAND_NAME} 启动中心", menu=pystray.Menu(
                 pystray.MenuItem("打开启动中心", restore, default=True),
                 pystray.MenuItem("停止并退出", closing)))
             tray.run_detached()

@@ -45,7 +45,8 @@ engine:
   danmaku_max_records_total: 0    # 每个监控最多保留记录数,0=不限
   account_check_interval_seconds: 1800   # 账号登录态定时体检间隔(秒,0=关闭)
   # 自有账号评论模式(创作中心)页面 URL —— 实验性,抖音改版/字段变了改这里
-  creator_comment_url: https://creator.douyin.com/creator-micro/interaction/comment-management
+  # 2026-09 抖音改版:评论管理迁至 data/following/comment,需逐作品选择加载评论
+  creator_comment_url: https://creator.douyin.com/creator-micro/data/following/comment
   creator_danmaku_url: https://creator.douyin.com/creator-micro/interaction/danmaku-management
   request_timeout_seconds: 20
   douyin_captcha_wait_seconds: 300 # 关键词采集遇验证时等待人工处理；期间不产生搜索请求
@@ -74,6 +75,20 @@ engine:
   native_write_require_verified_proxy: true # 已配代理的账号必须先通过“测试”建立出口基线
   native_write_proxy_max_age_seconds: 86400 # 出口基线有效期;过期后需重新测试代理
   browser_exit_probe_url: https://ipinfo.io/json
+
+  # ── TikTok 国际版网络闸门(v1.7.0)──
+  tiktok_require_proxy: true        # 必须绑定代理;无代理/探测失败一律阻断,禁止本机裸连
+  tiktok_allowed_exit_countries: "" # 允许出口 ISO2 逗号分隔,如 US,CA,JP;空=除封禁地区外都允许
+  tiktok_blocked_exit_countries: "CN,HK" # TikTok 不可用地区
+  tiktok_locale: en-US              # 浏览器界面固定语言;时区按出口国自动映射
+  tiktok_exit_probe_timeout_seconds: 8
+  tiktok_network_cache_ttl_seconds: 300 # 出口探测缓存(周期扫描复用;手动登录强制刷新)
+
+  # ── TikTok 关键词采集(Task 8)──
+  tiktok_captcha_wait_seconds: 300  # 搜索遇人机验证时,有头窗口被动等待人工处理的秒数
+  tiktok_keyword_gap_seconds: 10    # 同一任务相邻关键词错峰停顿
+  tiktok_item_gap_seconds: 2.5      # 相邻作品评论读取错峰停顿
+  tiktok_request_jitter: 0.35       # 停顿的正向随机抖动比例(0~1)
 
   # ── 写操作风控闸(取关/回关/私信 + 自动评论)──
   comment_hourly_cap_per_account: 10   # 每账号每小时自动评论上限(0=不限)
@@ -138,7 +153,7 @@ risk_control:
   network_group_cooldown_seconds: 7200
 
 storage:
-  db_path: ./data/creatorhub.db
+  db_path: ./data/mmmim.db
 
 # 代理池:建号时一号一代理 sticky 分配(占用最少优先)。务必用住宅/4G 长效代理,
 # 一号一长效固定 IP,IP 地区与账号时区/locale 一致;切勿机房 IP、切勿多号共享一个 IP。

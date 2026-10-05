@@ -84,7 +84,8 @@ class IdentityModeTests(unittest.TestCase):
 
         self.assertEqual(engine.xhs_browser_mode, "auto")
         self.assertTrue(engine.resident_browser_sessions)
-        self.assertEqual(engine.browser_session_idle_seconds, 1800)
+        # v1.6.6:空闲回收默认 30 分钟 -> 2 分钟(写任务用完即关,后台监控快速回收)
+        self.assertEqual(engine.browser_session_idle_seconds, 120)
         self.assertIsNone(engine.xhs_cdp_idle_seconds)
         self.assertEqual(engine.xhs_publish_mode, "browser")
         self.assertEqual(engine.xhs_comment_write_mode, "browser")

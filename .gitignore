@@ -41,3 +41,14 @@ config.yaml
 
 # 内部方案文档(不随公开仓库发布)
 docs/
+
+# 授权：私钥绝不分发/提交；license.dat 为客户本地文件
+tools/keys/
+license.dat
+
+# 本地调试探针与回归日志（含真实账号抓包数据，不提交）
+/_tmp_*
+/t*_*.log
+
+# 本地 agent 规格/技能工作目录（不随仓库发布）
+.trae/

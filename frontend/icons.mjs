@@ -26,7 +26,7 @@ export async function buildIcons() {
   // Brand geometry is canonical, not whatever a previous icon build left behind.
   const brandSource = await readFile("frontend/brand.svg", "utf8");
   const brandSvg = brandSource.match(/<svg\s([^>]+)>([\s\S]*?)<\/svg>/);
-  if (!brandSvg) throw new Error("Missing original CreatorHub brand mark");
+  if (!brandSvg) throw new Error("Missing original mmm brand mark");
   const brand = `<symbol id="i-brand" ${brandSvg[1].replace(/\s*xmlns="[^"]+"/, "")}>${brandSvg[2].trim()}</symbol>`;
   const symbols = await Promise.all(Object.entries(icons).map(async ([id, name]) => {
     const source = await readFile(`node_modules/lucide-static/icons/${name}.svg`, "utf8");

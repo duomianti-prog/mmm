@@ -447,7 +447,8 @@ async def publish_xhs_browser(
 
     try:
         async with mgr.visible_page(
-                identity, url=_publish_url(media_type)) as page:
+                identity, url=_publish_url(media_type),
+                keep_context=False) as page:  # 一次性写任务:结束即关该账号 Chrome
             if "login" in page.url or "passport" in page.url:
                 return XhsWriteOutcome("failed", error="logged_out:创作平台未登录")
 
@@ -576,17 +577,226 @@ async def _locator_visible(locator: Any) -> bool:
         return False
 
 
-async def _find_reply_target(page: Any, comment_id: str, target_text: str):
-    if comment_id:
-        safe_id = str(comment_id).replace('"', '\\"')
-        locator = page.locator(f'[data-comment-id="{safe_id}"]').first
-        if await _locator_visible(locator):
-            return locator
-    if target_text:
-        locator = page.get_by_text(target_text, exact=True).first
-        if await _locator_visible(locator):
-            return locator
-    return None
+# 锚定目标评论的“整行根容器”并打 data-mmm-xhs-root 标记。
+# 教训:[data-comment-id] 往往只挂在内层内容节点上,而“回复”操作按钮在
+# 外层兄弟节点;exact 文本匹配又会被昵称/@/子评论干扰。改为页面端:
+# 从 cid 锚点(或文本命中节点)向上找第一个“内含可见‘回复’叶子”的祖先。
+_XHS_ANCHOR_REPLY_ROOT = r"""
+(args) => {
+  const [cid, text] = args;
+  const ZW = /[\s\u200B-\u200F\uFEFF]/g;
+  const norm = s => (s || '').replace(ZW, '');
+  const vis = el => {
+    if (!el) return false;
+    let r;
+    try { r = el.getBoundingClientRect(); } catch (e) { return false; }
+    if (!r || r.width < 4 || r.height < 4) return false;
+    const st = getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden'
+        || (+st.opacity || 1) < 0.1) return false;
+    return true;
+  };
+  const isReplyLeaf = el => {
+    const t = (el.innerText || el.textContent || '').trim();
+    return t === '回复' || t === '回 复';
+  };
+  // 该子树内是否存在可见且文本恰为“回复”的叶子
+  const subtreeHasReply = root => {
+    let hit = false;
+    root.querySelectorAll('span,a,button,p,div,em').forEach(el => {
+      if (hit) return;
+      if (isReplyLeaf(el) && vis(el)) hit = true;
+    });
+    return hit;
+  };
+  document.querySelectorAll('[data-mmm-xhs-root]')
+    .forEach(el => el.removeAttribute('data-mmm-xhs-root'));
+  let anchor = null;
+  let via = '';
+  if (cid) {
+    const safe = String(cid).replace(/"/g, '\\"');
+    const nodes = document.querySelectorAll('[data-comment-id="' + safe + '"]');
+    for (const n of nodes) { if (vis(n) || n.querySelector('*')) { anchor = n; break; } }
+    if (anchor) via = 'cid';
+  }
+  const want = norm(text).slice(0, 12);
+  if (!anchor && want) {
+    // 文本兜底:在评论行候选里找内容包含片段的节点
+    const rows = document.querySelectorAll(
+      '[data-comment-id],[class*="comment-item"],[class*="commentItem"],'
+      + '[class*="parent-comment"],[class*="comment-inner"]');
+    for (const row of rows) {
+      if (norm(row.innerText || '').indexOf(want) !== -1) { anchor = row; via = 'text'; break; }
+    }
+  }
+  if (!anchor) {
+    const n = document.querySelectorAll('[data-comment-id]').length;
+    return { found: false, reason: 'no-target', nComments: n };
+  }
+  let chosen = null;
+  let el = anchor;
+  for (let i = 0; el && i < 9; i++, el = el.parentElement) {
+    if (subtreeHasReply(el)) { chosen = el; break; }
+  }
+  if (!chosen) {
+    // 向上未找到含回复按钮的祖先:退回最深的评论行样式祖先
+    el = anchor;
+    for (let i = 0; el && i < 6; i++, el = el.parentElement) {
+      const cls = String(el.className || '');
+      if (/comment[-_]?item|commentItem|parent-comment|comment-inner/.test(cls)) {
+        chosen = el;
+        break;
+      }
+    }
+  }
+  if (!chosen) chosen = anchor;
+  chosen.setAttribute('data-mmm-xhs-root', '1');
+  return {
+    found: true, via: via || 'fallback',
+    snippet: (chosen.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+  };
+}
+"""
+
+# 在已锚定的评论根内找“可见可点且未被遮挡”的回复按钮并打标。
+# 小红书桌面端回复按钮常需 hover 评论行后才渲染/显色,因此 Python 侧会先
+# 真实 hover;此 JS 也负责在 hover 后做最终判定,并排除“展开 N 条回复”。
+_XHS_FIND_REPLY_BUTTON = r"""
+() => {
+  const root = document.querySelector('[data-mmm-xhs-root="1"],[data-mmm-xhs-root]');
+  if (!root) return { found: false, reason: 'no-root-mark' };
+  document.querySelectorAll('[data-mmm-xhs-reply]')
+    .forEach(el => el.removeAttribute('data-mmm-xhs-reply'));
+  const vis = el => {
+    if (!el) return false;
+    let r;
+    try { r = el.getBoundingClientRect(); } catch (e) { return false; }
+    if (!r || r.width < 4 || r.height < 4) return false;
+    const st = getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden'
+        || (+st.opacity || 1) < 0.1) return false;
+    return true;
+  };
+  const t = el => (el.innerText || el.textContent || '').trim();
+  const BAD = /查看回复|展开|收起|条回复|更多回复|回复\s*[(（]?\s*\d|回复数/;
+  const cands = [];
+  root.querySelectorAll('span,a,button,p,em,i,[class*="reply"],[class*="operation"] *')
+    .forEach(el => {
+      const text = t(el);
+      const attrHit = /reply/i.test(
+        String(el.className || '') + ' ' + String(el.id || '')
+        + ' ' + String(el.getAttribute('data-name') || ''));
+      const textHit = (text === '回复' || text === '回 复');
+      if (!textHit && !attrHit) return;
+      if (BAD.test(text)) return;
+      // class 命中但文本是一整块容器(如整条评论)时跳过,只留小叶子
+      if (!textHit && text.length > 8) return;
+      cands.push({ el, textHit, attrHit,
+                   area: (() => { const r = el.getBoundingClientRect();
+                                  return r.width * r.height; })() });
+    });
+  cands.sort((a, b) => {
+    if (a.textHit !== b.textHit) return a.textHit ? -1 : 1;
+    if (a.attrHit !== b.attrHit) return a.attrHit ? -1 : 1;
+    return a.area - b.area;
+  });
+  for (const c of cands) {
+    const el = c.el;
+    if (!vis(el)) continue;
+    try {
+      const r = el.getBoundingClientRect();
+      const top = document.elementFromPoint(
+        r.left + r.width / 2, r.top + r.height / 2);
+      if (top && top !== el && !el.contains(top)
+          && !(top.contains && top.contains(el))) continue;
+    } catch (e) {}
+    el.setAttribute('data-mmm-xhs-reply', '1');
+    return { found: true, tag: el.tagName || '',
+             text: t(el).slice(0, 10), n: cands.length };
+  }
+  // 诊断:回复区长什么样
+  let diag = '';
+  try {
+    const ops = root.querySelector('[class*="operation"],[class*="footer"],[class*="interact"]');
+    diag = (ops || root).innerText.replace(/\s+/g, ' ').trim().slice(0, 160);
+  } catch (e) {}
+  return { found: false, reason: 'no-visible-reply-btn',
+           nCand: cands.length, diag: diag };
+}
+"""
+
+# hover 评论行:触发 React 的 mouseenter/mousemove,使操作按钮显色。
+_XHS_HOVER_ROOT = r"""
+() => {
+  const root = document.querySelector('[data-mmm-xhs-root="1"],[data-mmm-xhs-root]');
+  if (!root) return false;
+  try {
+    const r = root.getBoundingClientRect();
+    const x = Math.max(2, r.left + Math.min(r.width / 2, 120));
+    const y = r.top + Math.min(r.height / 2, 40);
+    const fire = (type, target) => {
+      try {
+        target.dispatchEvent(new MouseEvent(type, {
+          bubbles: true, cancelable: true, view: window,
+          clientX: x, clientY: y, relatedTarget: root }));
+      } catch (e) {}
+    };
+    let node = root;
+    for (let i = 0; node && i < 4; i++, node = node.parentElement) {
+      fire('mouseover', node);
+      fire('mousemove', node);
+      fire('mouseenter', node);
+    }
+    return true;
+  } catch (e) { return false; }
+}
+"""
+
+
+async def _open_xhs_reply_entry(page: Any, interaction: Any,
+                                comment_id: str, target_text: str,
+                                max_scrolls: int) -> tuple[bool, str]:
+    """定位目标评论并点开它的“回复”入口。成功返回 (True, '')。"""
+    anchor = None
+    n_comments = 0
+    for _ in range(max(0, int(max_scrolls)) + 1):
+        try:
+            anchor = await page.evaluate(
+                _XHS_ANCHOR_REPLY_ROOT, [comment_id or "", target_text or ""])
+        except Exception as exc:
+            return False, f"评论定位脚本异常: {exc!r}"
+        if anchor and anchor.get("found"):
+            break
+        n_comments = int((anchor or {}).get("nComments") or 0)
+        await interaction.scroll_step(page)
+    if not anchor or not anchor.get("found"):
+        return False, (
+            f"未找到目标评论,已停止且不会降级为顶层评论"
+            f"(当前页评论节点 {n_comments} 个)")
+    root = page.locator('[data-mmm-xhs-root]').first
+    with suppress(Exception):
+        await root.scroll_into_view_if_needed(timeout=4000)
+    # hover 评论行使“回复”按钮出现(真实鼠标事件 + JS 合成事件双保险),
+    # 然后在多轮内重新判定按钮可见性。
+    for attempt in range(4):
+        with suppress(Exception):
+            await root.hover(force=True, timeout=3000)
+        with suppress(Exception):
+            await page.evaluate(_XHS_HOVER_ROOT)
+        await interaction.pause(0.35, 0.7)
+        found = None
+        with suppress(Exception):
+            found = await page.evaluate(_XHS_FIND_REPLY_BUTTON)
+        if found and found.get("found"):
+            reply = page.locator('[data-mmm-xhs-reply="1"]').first
+            await interaction.click_visible(reply)
+            await interaction.pause(0.2, 0.45)
+            return True, ""
+        if attempt == 3 and found:
+            return False, (
+                "已找到目标评论,但未找到该评论的回复入口"
+                f"(候选 {found.get('nCand', 0)} 个;操作区: {found.get('diag', '')[:120]})")
+    return False, "已找到目标评论,但未找到该评论的回复入口(hover 后仍不可见)"
 
 
 async def _find_comment_input(page: Any):
@@ -635,43 +845,18 @@ async def comment_xhs_browser(
     page = None
 
     try:
-        async with mgr.visible_page(identity, url=url) as page:
+        async with mgr.visible_page(
+                identity, url=url,
+                keep_context=False) as page:  # 写完即关该账号 Chrome,不残留窗口
             if "login" in page.url or "passport" in page.url:
                 return XhsWriteOutcome("failed", error="logged_out:账号未登录")
 
             if target_comment_id:
-                target = await _find_reply_target(
-                    page, target_comment_id, target_text)
-                for _ in range(max(0, int(max_scrolls))):
-                    if target is not None:
-                        break
-                    await interaction.scroll_step(page)
-                    target = await _find_reply_target(
-                        page, target_comment_id, target_text)
-                if target is None:
-                    return XhsWriteOutcome(
-                        "failed", error="未找到目标评论，已停止且不会降级为顶层评论")
-
-                reply = None
-                try:
-                    reply = target.get_by_text("回复", exact=True).first
-                    if not await _locator_visible(reply):
-                        reply = None
-                except Exception:
-                    reply = None
-                if reply is None:
-                    try:
-                        reply = target.locator(
-                            'button:has-text("回复"),[class*="reply"]').first
-                        if not await _locator_visible(reply):
-                            reply = None
-                    except Exception:
-                        reply = None
-                if reply is None:
-                    return XhsWriteOutcome(
-                        "failed", error="已找到目标评论，但未找到该评论的回复入口")
-                await interaction.click_visible(reply)
-                await interaction.pause(0.2, 0.45)
+                ok_entry, entry_error = await _open_xhs_reply_entry(
+                    page, interaction, target_comment_id, target_text,
+                    max_scrolls=max_scrolls)
+                if not ok_entry:
+                    return XhsWriteOutcome("failed", error=entry_error)
 
             editor = await _find_comment_input(page)
             for _ in range(max(0, int(max_scrolls))):
@@ -697,6 +882,9 @@ async def comment_xhs_browser(
                     send, interaction,
                     attempts=max(4, min(60, timeout_seconds * 2))):
                 return XhsWriteOutcome("failed", error="评论发送按钮当前不可用")
+            # 拟人停顿:文字输入完到点击发送之间随机停 0.8-1.8 秒再提交,
+            # 不影响按钮激活判定(上面已事件驱动地等待 enabled)。
+            await interaction.pause(0.8, 1.8)
             existing_matches = 0
             try:
                 existing_matches = int(await page.get_by_text(

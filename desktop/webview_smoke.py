@@ -17,7 +17,7 @@ def smoke():
         prepare_home(home)
         server = ShellServer(Controller(home, install_browser=False))
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        window = webview.create_window("CreatorHub renderer test", server.origin, hidden=True)
+        window = webview.create_window("mmm renderer test", server.origin, hidden=True)
 
         def verify():
             try:

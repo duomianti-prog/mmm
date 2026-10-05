@@ -20,6 +20,15 @@ SEARCH_API = "/api/sns/web/v2/search/notes"
 SEARCH_API_LEGACY = "/api/sns/web/v1/search/notes"
 FEED_API = "/api/sns/web/v1/feed"
 COMMENT_API = "/api/sns/web/v2/comment/page"
+# 评论列表端点放宽:v2/v1 主页评论与子评论页都算,页面灰度/改版时不至于漏拦。
+COMMENT_API_MARKERS = ("/comment/page", "/comment/sub/page")
+
+
+def _is_comment_api(url: str) -> bool:
+    path = str(url or "").lower().split("?", 1)[0]
+    return any(marker in path for marker in COMMENT_API_MARKERS)
+
+
 # 小红书网页端「当前登录用户」接口(旧的 v1/user/selfinfo 已不再用)
 USER_ME_API = "/api/sns/web/v2/user/me"
 
@@ -214,6 +223,122 @@ async def _scroll_collection(mgr: BrowserManager, page, collection: dict,
                 return
         else:
             stagnant = 0
+
+
+# 桌面端笔记页评论在右侧“独立滚动容器”里,page.mouse.wheel 在鼠标未悬停
+# 评论区时滚的是外层页面,评论不会翻页加载。改为页面端直接定位评论容器
+# 滚动,并顺带从 DOM 抽取已渲染评论(端点改版/SSR 结构变化时的兜底数据源)。
+_XHS_COMMENT_SCROLL_DRAIN_JS = r"""
+() => {
+  const SELS = [
+    '[class*="comments-container"]', '[class*="comment-container"]',
+    '[class*="commentContainer"]', '[class*="comment-list"]',
+    '[class*="commentContainer"] [class*="list"]',
+    '[class*="note-detail"] [class*="list-container"]'
+  ];
+  const isScrollable = el => {
+    const st = getComputedStyle(el);
+    return el.scrollHeight - el.clientHeight > 24
+      && /(auto|scroll)/.test(st.overflowY + ' ' + st.overflow);
+  };
+  let root = null;
+  let bestScore = 0;
+  for (const sel of SELS) {
+    document.querySelectorAll(sel).forEach(el => {
+      const items = el.querySelectorAll('[data-comment-id]').length;
+      const score = items + (isScrollable(el) ? 100 : 0);
+      if (score > bestScore) { bestScore = score; root = el; }
+    });
+  }
+  if (!root) {
+    // 兜底:从任一评论节点向上找可滚动祖先
+    const a = document.querySelector('[data-comment-id]');
+    let p = a;
+    for (let i = 0; p && i < 9; i++, p = p.parentElement) {
+      if (isScrollable(p)) { root = p; break; }
+    }
+  }
+  // 拟人增量滚动(单步 <=900px,由浏览器自己派发 scroll 事件);
+  // 不直接写滚动条偏移,避免瞬间跳底被识别/不触发分页。
+  let beforeAnchorTop = null;
+  if (root) {
+    const a0 = root.querySelector('[data-comment-id]');
+    if (a0) beforeAnchorTop = a0.getBoundingClientRect().top;
+    root.scrollBy(0, 640);
+    try { root.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (e) {}
+  }
+  const rowClass = /comment[-_]?item|parent-comment|commentItem/;
+  const comments = [];
+  const seen = {};
+  document.querySelectorAll('[data-comment-id]').forEach(node => {
+    let row = node;
+    for (let i = 0; row && i < 6; i++, row = row.parentElement) {
+      if (rowClass.test(String(row.className || ''))) break;
+    }
+    row = row || node;
+    let cid = node.getAttribute('data-comment-id') || '';
+    if (!cid && row.getAttribute) cid = row.getAttribute('data-comment-id') || '';
+    if (!cid || seen[cid]) return;
+    seen[cid] = 1;
+    let content = '';
+    const cEl = row.querySelector(
+      '[class*="content"],[class*="note-text"],[class*="text"]');
+    if (cEl) content = (cEl.innerText || '').trim();
+    if (!content) content = (row.innerText || '').trim();
+    let nick = '';
+    const nEl = row.querySelector(
+      '[class*="name"] a,[class*="name"] span,[class*="user"] a,a[class*="name"],[class*="author"]');
+    if (nEl) nick = (nEl.innerText || '').trim();
+    let like = 0;
+    const lEl = row.querySelector('[class*="like"]');
+    if (lEl) {
+      const mm = (lEl.innerText || '').match(/([\d.]+)\s*(wan|万)?/);
+      if (mm) {
+        like = parseFloat(mm[1]) || 0;
+        if (mm[2]) like *= 10000;
+      }
+    }
+    if (content) {
+      comments.push({
+        id: cid,
+        content: content.slice(0, 1000),
+        user_info: { nickname: nick.slice(0, 64) },
+        like_count: like,
+        _source: 'dom'
+      });
+    }
+  });
+  const containerInfo = root ? (() => {
+    const items = root.querySelectorAll('[data-comment-id]');
+    const last = items.length ? items[items.length - 1] : null;
+    const rb = root.getBoundingClientRect();
+    const nowAnchor = items.length ? items[0].getBoundingClientRect().top : null;
+    return {
+      found: true,
+      cls: String(root.className || '').slice(0, 120),
+      scrollHeight: root.scrollHeight,
+      clientHeight: root.clientHeight,
+      atBottom: !!last && last.getBoundingClientRect().bottom - rb.bottom <= 32,
+      moved: nowAnchor !== null && beforeAnchorTop !== null
+        && Math.abs(nowAnchor - beforeAnchorTop) > 8
+    };
+  })() : { found: false };
+  return JSON.stringify({
+    comments: comments,
+    nItems: document.querySelectorAll('[data-comment-id]').length,
+    container: containerInfo
+  });
+}
+"""
+
+
+async def _drain_xhs_comment_dom(page) -> dict:
+    """滚动评论容器一轮并抽取 DOM 评论;失败返回空 dict(不影响拦截链路)。"""
+    try:
+        raw = await page.evaluate(_XHS_COMMENT_SCROLL_DRAIN_JS)
+        return json.loads(raw or "{}") if isinstance(raw, str) else (raw or {})
+    except Exception:
+        return {}
 
 
 async def _xhs_reading_pause(
@@ -541,9 +666,18 @@ async def fetch_xhs_comments(mgr: BrowserManager, identity: Identity, note_id: s
     collected: Dict[str, dict] = {}
     error = ""
     page_failure = ""
+    diag = {"api_hits": 0, "dom_items": 0, "container": "unknown"}
+
+    def _absorb_dom(comments) -> None:
+        # API 数据更权威:DOM 只补 API 没给的 cid,绝不覆盖。
+        for c in comments or []:
+            cid = str(c.get("id") or "")
+            if cid and cid not in collected:
+                collected[cid] = c
 
     async def on_response(resp):
-        if COMMENT_API in resp.url:
+        if _is_comment_api(resp.url) and int(getattr(resp, "status", 0) or 0) == 200:
+            diag["api_hits"] += 1
             try:
                 data = (await resp.json()).get("data") or {}
             except Exception:
@@ -557,7 +691,7 @@ async def fetch_xhs_comments(mgr: BrowserManager, identity: Identity, note_id: s
         async with _visible_page_scope(mgr, identity, False) as page:
             page.on("response", on_response)
             responses = _ResponseInbox(
-                page, lambda r: COMMENT_API in r.url and r.status == 200)
+                page, lambda r: _is_comment_api(r.url) and r.status == 200)
             await page.goto(
                 _note_url(note_id, xsec_token, xsec_source),
                 wait_until="domcontentloaded", timeout=30000)
@@ -572,6 +706,14 @@ async def fetch_xhs_comments(mgr: BrowserManager, identity: Identity, note_id: s
                         collected[cid] = comment
             except Exception:
                 pass
+            # 首屏 DOM 兜底(评论已渲染但既无 XHR 也无 SSR 状态时)
+            first_drain = await _drain_xhs_comment_dom(page)
+            _absorb_dom(first_drain.get("comments"))
+            diag["dom_items"] = max(
+                diag["dom_items"], int(first_drain.get("nItems") or 0))
+            cinfo = first_drain.get("container") or {}
+            diag["container"] = (
+                "found" if cinfo.get("found") else "missing")
             if not collected:
                 page_failure = await _xhs_page_failure(page)
             if not collected and not page_failure:
@@ -580,12 +722,47 @@ async def fetch_xhs_comments(mgr: BrowserManager, identity: Identity, note_id: s
                 if not collected:
                     page_failure = await _xhs_page_failure(page)
             if not page_failure:
-                await _scroll_collection(
-                    mgr, page, collected, max_scrolls, known_cids)
+                # 评论在独立滚动容器内:页面端滚容器 + DOM 抽取;
+                # 连续两轮无新增且容器到底即停。找不到容器时用真实滚轮兜底。
+                stagnant = 0
+                last_n = len(collected)
+                for _ in range(max(0, int(max_scrolls))):
+                    drain = await _drain_xhs_comment_dom(page)
+                    cinfo = drain.get("container") or {}
+                    if cinfo.get("found"):
+                        diag["container"] = "found"
+                    else:
+                        diag["container"] = "missing"
+                        await mgr.xhs_interaction.scroll_step(page)
+                    diag["dom_items"] = max(
+                        diag["dom_items"], int(drain.get("nItems") or 0))
+                    _absorb_dom(drain.get("comments"))
+                    # 给 XHR 一点落地时间,顺带拟人停顿
+                    pause = getattr(getattr(mgr, "xhs_interaction", None),
+                                    "pause", None)
+                    if callable(pause):
+                        await pause(0.5, 1.1)
+                    if len(collected) == last_n:
+                        stagnant += 1
+                        if stagnant >= 2 and cinfo.get("atBottom"):
+                            break
+                    else:
+                        stagnant = 0
+                    last_n = len(collected)
+                # 滚动结束后再收一次尾流
+                await responses.wait(900, on_response)
+                tail = await _drain_xhs_comment_dom(page)
+                _absorb_dom(tail.get("comments"))
+                diag["dom_items"] = max(
+                    diag["dom_items"], int(tail.get("nItems") or 0))
             if not collected:
                 page_failure = await _xhs_page_failure(page)
         if not collected and not error:
-            error = page_failure or "未拦截到评论（笔记可能暂无评论，或 xsec_token 已过期）"
+            error = page_failure or (
+                "未拦截到评论（笔记可能暂无评论，或 xsec_token 已过期；"
+                f"诊断: 评论接口命中 {diag['api_hits']} 次,"
+                f"DOM 评论项 {diag['dom_items']} 个,"
+                f"评论滚动容器{diag['container']}）")
     except Exception as e:
         error = f"打开笔记页失败: {e!r}"
 

@@ -33,11 +33,29 @@ def resources() -> Path:
 
 
 def user_directory() -> Path:
-    override = os.environ.get("CREATORHUB_DESKTOP_HOME")
+    override = (os.environ.get("MMM_DESKTOP_HOME")
+                or os.environ.get("CREATORHUB_DESKTOP_HOME"))
     if override:
         return Path(override).expanduser().resolve()
     base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".local" / "share")))
-    return base / "CreatorHub" / "user-data"
+    new_home = base / "mmm" / "user-data"
+    legacy_home = base / "CreatorHub" / "user-data"
+    # 品牌改名后的一次性数据迁移：新目录不存在且旧目录存在时搬过去；
+    # 搬不动（旧程序仍在运行/权限不足）就继续使用旧目录，不阻塞启动。
+    if not new_home.exists() and legacy_home.exists():
+        try:
+            new_home.parent.mkdir(parents=True, exist_ok=True)
+            legacy_home.rename(new_home)
+            print(f"[mmm] 已迁移用户数据目录：{legacy_home} -> {new_home}", flush=True)
+        except OSError:
+            try:
+                shutil.copytree(legacy_home, new_home)
+                print(f"[mmm] 已复制用户数据目录（旧目录保留）：{legacy_home} -> {new_home}",
+                      flush=True)
+            except OSError:
+                print("[mmm] 用户数据目录迁移失败，继续使用旧目录", flush=True)
+                return legacy_home
+    return new_home
 
 
 def version() -> str:
@@ -59,7 +77,7 @@ def snapshot(home: Path) -> Path:
     import yaml
     config = home / "config.yaml"
     raw = yaml.safe_load(config.read_text(encoding="utf-8")) or {}
-    db = Path((raw.get("storage") or {}).get("db_path", "data/creatorhub.db"))
+    db = Path((raw.get("storage") or {}).get("db_path", "data/mmmim.db"))
     if not db.is_absolute():
         db = home / db
     filename = home / "backups" / f"settings-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}.zip"
@@ -135,7 +153,13 @@ def _serve(home: Path, session: str, install_browser: bool) -> int:
         os.environ["CREATORHUB_DESKTOP"] = "1"
     else:
         os.environ.pop("CREATORHUB_DESKTOP", None)
-    if install_browser:
+    # 授权门控：未授权时跳过浏览器组件下载，uvicorn 仍启动以提供授权提示页。
+    from app.license_core import evaluate as evaluate_license, gate_passed
+    _lic = evaluate_license()
+    license_ok = gate_passed(_lic)
+    if not license_ok:
+        print(f"[license] {_lic['status_text']}；指纹：{_lic['fingerprint']}", flush=True)
+    if install_browser and license_ok:
         from patchright.sync_api import sync_playwright
         with sync_playwright() as playwright:
             available = Path(playwright.chromium.executable_path).is_file()
@@ -162,6 +186,33 @@ def _serve(home: Path, session: str, install_browser: bool) -> int:
     temp = state.with_suffix(".tmp")
     temp.write_text(json.dumps({"port": port}), encoding="utf-8")
     temp.replace(state)
+    sockets = [sock]
+    lan_sock = None
+    # 局域网客服服务器模式(客服设置页开启):额外监听 0.0.0.0,
+    # 安全边界由 LocalAccessMiddleware 保证——非本机来源只允许 /api/cs/* 与
+    # /chat/* 客服路径,其余一律 403。
+    try:
+        from app.settings import get_setting as _get_setting
+        if (_get_setting("cs_lan_enabled", "") or "") == "1":
+            try:
+                lan_port = int((_get_setting("cs_lan_port", "") or "").strip()
+                               or "8080")
+            except ValueError:
+                lan_port = 8080
+            lan_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                lan_sock.bind(("0.0.0.0", lan_port))
+                lan_sock.listen(128)
+                sockets.append(lan_sock)
+                print(f"[cs-lan] 局域网客服服务已监听 0.0.0.0:{lan_port}",
+                      flush=True)
+            except OSError as e:
+                print(f"[cs-lan] 局域网端口 {lan_port} 绑定失败({e}),"
+                      "仅本机模式运行", flush=True)
+                lan_sock.close()
+                lan_sock = None
+    except Exception as e:
+        print(f"[cs-lan] 读取局域网配置失败({e!r}),仅本机模式运行", flush=True)
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, workers=1, log_config=None))
     stop = home / "runtime" / f"{session}.stop"
     def watch_stop():
@@ -172,10 +223,12 @@ def _serve(home: Path, session: str, install_browser: bool) -> int:
             time.sleep(.25)
     threading.Thread(target=watch_stop, daemon=True).start()
     try:
-        server.run(sockets=[sock])
+        server.run(sockets=sockets)
     finally:
         server.should_exit = True
         sock.close()
+        if lan_sock is not None:
+            lan_sock.close()
         state.unlink(missing_ok=True)
         stop.unlink(missing_ok=True)
     return 0
@@ -200,7 +253,7 @@ def smoke_test() -> int:
             assert (resources() / "config.example.yaml").is_file()
             assert (resources() / "desktop-guide" / "xhs" / "index.html").is_file()
             if getattr(sys, "frozen", False):
-                updater = resources() / "desktop" / "CreatorHubUpdater.exe"
+                updater = resources() / "desktop" / "mmmUpdater.exe"
                 assert updater.is_file()
                 from desktop.update_helper import clean_environment
                 subprocess.run([str(updater), "--self-test"], env=clean_environment(),
@@ -256,7 +309,7 @@ def recover_interrupted_update(home):
     if not journal or journal.get("phase") in {"committed", "rolled_back"}:
         return False
     from desktop.update_helper import clean_environment
-    helper = home / "runtime/updates" / journal["attempt"] / "CreatorHubUpdater.exe"
+    helper = home / "runtime/updates" / journal["attempt"] / "mmmUpdater.exe"
     ready = home / "runtime/update-recovery-ready.json"
     ready.unlink(missing_ok=True)
     (home / "runtime/update-recovery-cancel").unlink(missing_ok=True)
@@ -293,8 +346,69 @@ class Launcher:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(100, self.poll)
 
+    def license_dialog(self):
+        """授权未通过时弹出的 Tk 对话框，展示指纹并支持重新检查。"""
+        from app.license_core import evaluate, gate_passed
+        import tkinter as tk
+        info = evaluate()
+        dialog = tk.Toplevel(self.root)
+        dialog.title("mmm 授权验证")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        frame = tk.Frame(dialog, padx=22, pady=18)
+        frame.pack(fill="both", expand=True)
+        tk.Label(frame, text=info["status_text"], font=("Microsoft YaHei UI", 13, "bold"),
+                 fg="#b42318").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        tk.Label(frame, text="请将服务人员分发的 license.dat 放到数据目录，\n或程序所在目录后，点击“重新检查”。",
+                 justify="left", font=("Microsoft YaHei UI", 9)).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        tk.Label(frame, text="机器指纹（发给服务人员）：", font=("Microsoft YaHei UI", 9, "bold")
+                 ).grid(row=2, column=0, columnspan=2, sticky="w")
+        fp_var = tk.StringVar(value=info["fingerprint"])
+        entry = tk.Entry(frame, textvariable=fp_var, width=52, state="readonly",
+                         readonlybackground="#f5f5f7", font=("Consolas", 9))
+        entry.grid(row=3, column=0, columnspan=2, sticky="we", pady=(2, 8))
+        paths = info.get("searched_paths") or []
+        if paths:
+            tk.Label(frame, text=f"授权文件位置：{paths[0]}", foreground="#6b7280",
+                     font=("Microsoft YaHei UI", 8), wraplength=420, justify="left"
+                     ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        message = tk.StringVar()
+        tk.Label(frame, textvariable=message, foreground="#b42318", font=("Microsoft YaHei UI", 9)
+                 ).grid(row=5, column=0, columnspan=2, sticky="w")
+
+        def copy_fp():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(info["fingerprint"])
+            message.set("指纹已复制")
+
+        def open_home():
+            os.startfile(str(self.home))  # type: ignore[attr-defined]
+
+        def recheck():
+            if gate_passed():
+                dialog.destroy()
+                self.start()
+            else:
+                latest = evaluate()
+                message.set(latest["status_text"] + "，请确认授权文件后重试。")
+
+        buttons = tk.Frame(frame)
+        buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        tk.Button(buttons, text="复制指纹", width=10, command=copy_fp).pack(side="left", padx=4)
+        tk.Button(buttons, text="打开数据目录", width=12, command=open_home).pack(side="left", padx=4)
+        tk.Button(buttons, text="重新检查", width=10, command=recheck, default="active").pack(side="left", padx=4)
+        dialog.grab_set()
+        x = self.root.winfo_rootx() + 80
+        y = self.root.winfo_rooty() + 80
+        dialog.geometry(f"+{x}+{y}")
+
     def start(self):
         if self.closing or self.busy or (self.process and self.process.poll() is None):
+            return
+        from app.license_core import gate_passed
+        if not gate_passed():
+            self.license_dialog()
             return
         self.busy = True
         self.launch_done.clear()
@@ -417,7 +531,7 @@ class Launcher:
                 import pystray
                 from desktop.ui import brand_image
                 icon = brand_image()
-                self.tray = pystray.Icon("CreatorHub", icon, "CreatorHub 正在本地运行", menu=pystray.Menu(
+                self.tray = pystray.Icon("mmm", icon, "mmm 正在本地运行", menu=pystray.Menu(
                     pystray.MenuItem("打开管理器", lambda: self.events.put(("show", None)), default=True),
                     pystray.MenuItem("停止并退出", lambda: self.events.put(("exit", None)))))
                 self.tray.run_detached()
@@ -482,7 +596,12 @@ def main() -> int:
     parser.add_argument("--skip-browser-install", action="store_true")
     parser.add_argument("--legacy-ui", action="store_true", help="Use the legacy emergency window")
     parser.add_argument("--no-autostart", action="store_true")
+    parser.add_argument("--fingerprint", action="store_true", help="Print this machine fingerprint and exit")
     args = parser.parse_args()
+    if args.fingerprint:
+        from app.license_core import machine_fingerprint
+        print(machine_fingerprint())
+        return 0
     if args.update_health_check:
         return update_health_check()
     if args.shell_smoke_test:
@@ -507,7 +626,7 @@ def main() -> int:
             run_desktop(home, install_browser=not args.skip_browser_install)
     except Exception as exc:
         from tkinter import messagebox
-        messagebox.showerror("CreatorHub 启动提示", str(exc))
+        messagebox.showerror("mmm 启动提示", str(exc))
         return 1
     return 0
 

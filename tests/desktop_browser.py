@@ -40,7 +40,7 @@ def main():
                 expect(page.get_by_role("button", name="启动本地服务", exact=True)).to_be_enabled()
                 page.wait_for_timeout(1500)
                 assert controller.process is None and controller.worker is None
-                assert not (home / "data" / "creatorhub.db").exists()
+                assert not (home / "data" / "mmmim.db").exists()
                 done("opening the desktop waits for manual startup")
                 page.get_by_role("button", name="启动本地服务", exact=True).click()
                 expect(page.get_by_role("button", name="打开工作台", exact=True)).to_be_enabled(timeout=45000)

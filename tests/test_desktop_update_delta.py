@@ -21,7 +21,7 @@ from test_desktop_update_download import Response
 
 def bundle(root, version):
     (root / "_internal/app/web").mkdir(parents=True)
-    (root / "CreatorHub.exe").write_bytes(b"MZ-fixture-not-an-executable")
+    (root / "mmm.exe").write_bytes(b"MZ-fixture-not-an-executable")
     (root / "_internal/desktop-version.txt").write_text(version, encoding="utf-8")
     (root / "_internal/build-runtime.json").write_text('{"python":"fixture","pyinstaller":"fixture"}')
     (root / "_internal/app/web/app.js").write_bytes(b"old-ui")
@@ -35,7 +35,7 @@ def fixture(root):
     base = build_update(old, root / "baseline", "0.2.0")
     shutil.copytree(old, new)
     (new / "_internal/desktop-version.txt").write_text("0.2.1")
-    (new / "CreatorHub.exe").write_bytes(b"MZ-fixture-updated-python-code")
+    (new / "mmm.exe").write_bytes(b"MZ-fixture-updated-python-code")
     (new / "_internal/app/web/app.js").write_bytes(b"new-ui")
     (new / "_internal/added.py").write_text("NEW_CODE = True")
     (new / "_internal/removed.txt").unlink()
@@ -70,7 +70,7 @@ class DeltaTests(unittest.TestCase):
 
     def test_delta_contains_changed_code_and_new_files_not_unchanged_dependency(self):
         with zipfile.ZipFile(self.data["installer"]) as archive:
-            self.assertEqual(set(archive.namelist()), {"CreatorHub.exe", "_internal/desktop-version.txt",
+            self.assertEqual(set(archive.namelist()), {"mmm.exe", "_internal/desktop-version.txt",
                 "_internal/app/web/app.js", "_internal/added.py"})
         changed, removed = changes(self.manifest["delta"]["base_files"], self.manifest["files"])
         self.assertEqual(removed, ["_internal/removed.txt"])
@@ -126,7 +126,7 @@ class DeltaTests(unittest.TestCase):
     def test_second_rename_failure_rolls_back(self):
         rename = Path.rename
         def fail_candidate(path, target):
-            if path.name.startswith(".CreatorHub-next-"):
+            if path.name.startswith(".mmm-next-"):
                 raise PermissionError("Windows file lock fixture")
             return rename(path, target)
         with patch("desktop.update_delta.health_check"), patch.object(Path, "rename", fail_candidate), self.assertRaises(PermissionError):
@@ -150,8 +150,8 @@ class DeltaTests(unittest.TestCase):
 
     def test_recovery_after_old_directory_saved(self):
         attempt = self.data["attempt"]
-        previous = self.app.parent / (".CreatorHub-previous-" + attempt)
-        candidate = self.app.parent / (".CreatorHub-next-" + attempt)
+        previous = self.app.parent / (".mmm-previous-" + attempt)
+        candidate = self.app.parent / (".mmm-next-" + attempt)
         self.app.rename(previous)
         atomic_record(self.home / "runtime/update-transaction.json", {"schema": 1, "attempt": attempt,
             "phase": "old_saved", "install_dir": str(self.app), "previous": str(previous),
@@ -170,7 +170,7 @@ class DeltaTests(unittest.TestCase):
         verify_tree(self.app, self.manifest["files"])
 
     def release_info(self):
-        name = "CreatorHub-Setup-0.2.1-windows-x64.exe"
+        name = "mmm-Setup-0.2.1-windows-x64.exe"
         files = {p.name: p.read_bytes() for p in self.release.iterdir()}
         files[name] = b"fixture full installer" * 1000
         raw = {"tag_name": "v0.2.1", "assets": []}
@@ -200,7 +200,7 @@ class DeltaTests(unittest.TestCase):
 
     def test_client_falls_back_when_local_code_changed(self):
         info, files = self.release_info()
-        (self.app / "CreatorHub.exe").write_bytes(b"locally edited Python bundle")
+        (self.app / "mmm.exe").write_bytes(b"locally edited Python bundle")
         checker = UpdateChecker("0.2.0", self.home / "runtime/updates", self.app)
         with patch("desktop.updates.fetch_release", return_value=info), \
              patch("desktop.updates.open_asset", side_effect=lambda url: Response(files[url.rsplit('/', 1)[-1]])):

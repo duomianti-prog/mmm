@@ -70,7 +70,7 @@ def main():
                             f"Frozen workbench asset differs from the current build: {path}"
             (home / "runtime" / f"{session}.stop").touch()
             assert child.wait(timeout=35) == 0, "Service shutdown failed"
-            assert (home / "data" / "creatorhub.db").is_file()
+            assert (home / "data" / "mmmim.db").is_file()
             print("PASS: frozen imports, bundled resources, isolated database, port fallback, HTTP routes and graceful stop")
         except Exception:
             for log in (home / "logs").glob("*.log"):

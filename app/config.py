@@ -9,6 +9,12 @@ from typing import List
 
 import yaml
 
+# 抖音 2026-09 改版:创作中心评论管理页由 interaction/comment-management 迁至
+# data/following/comment(旧路径已 302 回首页);旧 config.yaml 里的旧值自动迁移。
+CREATOR_COMMENT_URL = "https://creator.douyin.com/creator-micro/data/following/comment"
+_CREATOR_COMMENT_URL_LEGACY = (
+    "https://creator.douyin.com/creator-micro/interaction/comment-management")
+
 
 @dataclass
 class EngineConfig:
@@ -30,7 +36,7 @@ class EngineConfig:
     account_check_interval_seconds: int = 1800  # 账号体检/闲置保活轮询间隔(0=关闭)
     idle_keepalive_hours: float = 6.0  # 闲置保活阈值:账号距上次活跃超此时长才摸一次(0=每轮都摸,退回旧行为)
     # 自有账号评论模式:创作中心评论管理页(实验性,抖音改版时改这里)
-    creator_comment_url: str = "https://creator.douyin.com/creator-micro/interaction/comment-management"
+    creator_comment_url: str = CREATOR_COMMENT_URL
     # 自有账号弹幕模式:创作中心弹幕管理页(实验性,抖音改版时改这里)
     creator_danmaku_url: str = "https://creator.douyin.com/creator-micro/interaction/danmaku-management"
     request_timeout_seconds: int = 20
@@ -51,12 +57,14 @@ class EngineConfig:
     fingerprint_chromium_root: str = ""     # 多内核扫描根目录；递归发现 chrome/chrome.exe
     fingerprint_chromium_allow_headless: bool = False  # 上游无头画像不完整，默认强制有头
     fingerprint_chromium_platform: str = "auto"       # auto | windows | linux | macos
-    # 小红书浏览器:默认优先连接 CreatorHub 管理的每账号系统 Chrome CDP。
+    # 小红书浏览器:默认优先连接 mmm 管理的每账号系统 Chrome CDP。
     xhs_browser_mode: str = "auto"          # auto | cdp | patchright
     # 账号浏览器默认常驻并复用同一 Profile/任务页；空闲后统一回收。旧配置
     # xhs_cdp_idle_seconds 仍兼容，0 表示仅按 LRU、显式关闭或退出回收。
     resident_browser_sessions: bool = True
-    browser_session_idle_seconds: int = 1800
+    # 空闲多久后回收常驻账号 Chrome。写任务结束后也会立即关闭该账号 Chrome,
+    # 这里只兜底后台监控遗留的会话(2 分钟,避免遗留一堆 chrome.exe)。
+    browser_session_idle_seconds: int = 120
     xhs_cdp_idle_seconds: int | None = None
     # 小红书读取默认也走账号浏览器页面，避免扫码 Cookie 在浏览器与签名直连
     # 客户端之间切换 UA/TLS/Client-Hints。api 只保留为显式兼容模式。
@@ -87,6 +95,18 @@ class EngineConfig:
     xhs_dm_auto_reply_enabled: bool = False
     active_accounts: int = 3                # 同一时刻最多并发活跃的账号数(错峰)
     scan_jitter: float = 0.15              # 周期扫描额外等待 0–15%，同一轮稳定，不缩短基础周期
+    # ── 人工任务优先 & 任务重试(v1.6.6)──
+    # 手动“立即发”等账号锁的最长时间:超时则明确提示“账号正被 XX 占用”,
+    # 不再无限转圈;等待期间后台长采集会在取消点主动让位。
+    manual_lock_wait_seconds: int = 90
+    # 单次关键词采集任务的硬超时:浏览器卡死时也会让出账号锁,任务稍后重排。
+    keyword_job_timeout_seconds: int = 240
+    # 人工「立即抓取」单条评论/弹幕监控的整体硬超时(含开浏览器+翻页),
+    # 超时返回明确错误而不是让前端无限转圈;后台周期扫描不受此限。
+    comment_scan_timeout_seconds: int = 180
+    # 瞬时失败(浏览器崩溃/页面超时/断网)的自动重试次数上限,指数退避。
+    transient_retry_max: int = 3
+    transient_retry_backoff_seconds: str = "300,900,2400"  # 5 分钟/15 分钟/40 分钟
     initial_scan_spread_seconds: int = 60  # 新监控/规则首次自动执行额外等待 0–60 秒；0 关闭
     route_download_via_proxy: bool = True   # 媒体下载是否走账号代理(避免 CDN 拉流暴露真实 IP)
     # ── 自动评论风控闸(写操作最敏感,宁慢勿快)──
@@ -120,6 +140,25 @@ class EngineConfig:
     native_write_require_verified_proxy: bool = True
     native_write_proxy_max_age_seconds: int = 86400
     browser_exit_probe_url: str = "https://ipinfo.io/json"
+    # ── TikTok 海外网络闸门(v1.7.0)──
+    #   tiktok.com 国际版必须经海外代理访问:无代理或出口在不可用地区时,
+    #   登录与读写前置硬阻断(区别于上面 verify_proxy_region 仅告警)。
+    tiktok_require_proxy: bool = True
+    # 允许出口地区(逗号分隔 ISO2);留空=除封禁地区外都允许。
+    tiktok_allowed_exit_countries: str = ""
+    # TikTok 不可用/明确不支持的出口地区(默认中国大陆+香港)。
+    tiktok_blocked_exit_countries: str = "CN,HK"
+    # TikTok 浏览器上下文固定界面语言;时区仍按出口国映射,不跟随系统。
+    tiktok_locale: str = "en-US"
+    tiktok_exit_probe_timeout_seconds: float = 8.0
+    # 同一账号出口探测结果缓存秒数(周期扫描复用;手动登录强制刷新)。
+    tiktok_network_cache_ttl_seconds: int = 300
+    # ── TikTok 关键词采集(v1.7.0 Task 8)──
+    #   搜索是风控高发场景,默认经有头窗口执行,人机校验时被动等待人工处理。
+    tiktok_captcha_wait_seconds: int = 300  # 遇人机验证时被动等待秒数;期间不重试接口
+    tiktok_keyword_gap_seconds: float = 10.0  # 同一任务相邻关键词的最小停顿
+    tiktok_item_gap_seconds: float = 2.5     # 相邻作品评论读取的最小停顿
+    tiktok_request_jitter: float = 0.35      # 上述停顿的正向随机抖动比例
     # ── 本账号作品健康监控(B5:盯自己作品的流量/0播/违规,发现异常推送通知)──
     #   借鉴竞品「流速监控 / 持续0播 / 作品违规监控」。默认关闭(需 periodic 同步本账号作品,较重)。
     work_health_enabled: bool = False         # 作品健康监控总开关
@@ -182,7 +221,7 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     engine: EngineConfig = field(default_factory=EngineConfig)
     risk_control: RiskControlConfig = field(default_factory=RiskControlConfig)
-    db_path: str = "./data/creatorhub.db"
+    db_path: str = "./data/mmmim.db"
     proxies: List[str] = field(default_factory=list)  # 代理池;建号时一号一代理 sticky 分配
 
 
@@ -198,6 +237,10 @@ def load_config(path: str | None = None) -> Config:
         e = raw.get("engine", {})
         cfg.engine = EngineConfig(**{k: v for k, v in e.items()
                                      if k in EngineConfig.__dataclass_fields__})
+        # 抖音 2026-09 改版:评论管理页旧路径 302 回首页,老配置值自动迁移到新页。
+        if str(cfg.engine.creator_comment_url or "").strip().rstrip("/") == \
+                _CREATOR_COMMENT_URL_LEGACY.rstrip("/"):
+            cfg.engine.creator_comment_url = CREATOR_COMMENT_URL
         if cfg.engine.xhs_browser_mode == "playwright":
             cfg.engine.xhs_browser_mode = "patchright"
         xhs_read_mode = str(
@@ -232,6 +275,14 @@ def load_config(path: str | None = None) -> Config:
             1, min(10, int(cfg.engine.xhs_dm_max_conversations_per_poll)))
         cfg.engine.xhs_dm_poll_jitter = min(
             1.0, max(0.0, float(cfg.engine.xhs_dm_poll_jitter)))
+        cfg.engine.tiktok_captcha_wait_seconds = max(
+            0, int(cfg.engine.tiktok_captcha_wait_seconds))
+        cfg.engine.tiktok_keyword_gap_seconds = max(
+            0.0, float(cfg.engine.tiktok_keyword_gap_seconds))
+        cfg.engine.tiktok_item_gap_seconds = max(
+            0.0, float(cfg.engine.tiktok_item_gap_seconds))
+        cfg.engine.tiktok_request_jitter = min(
+            1.0, max(0.0, float(cfg.engine.tiktok_request_jitter)))
         for name in ("scan_jitter", "comment_jitter"):
             value = float(getattr(cfg.engine, name))
             setattr(cfg.engine, name, min(1.0, max(0.0, value)) if math.isfinite(value) else 0.0)

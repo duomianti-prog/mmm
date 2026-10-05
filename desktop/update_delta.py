@@ -96,7 +96,7 @@ def health_check(app, environment):
         env = {**environment, "CREATORHUB_DESKTOP_HOME": temp,
                "CREATORHUB_CONFIG_PATH": str(Path(temp) / "absent.yaml")}
         with (Path(temp) / "health.log").open("wb") as log:
-            subprocess.run([str(app / "CreatorHub.exe"), "--update-health-check"],
+            subprocess.run([str(app / "mmm.exe"), "--update-health-check"],
                            cwd=temp, env=env, stdout=log, stderr=log,
                            check=True, timeout=90,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -119,8 +119,8 @@ def read_journal(home):
         if data[name].is_symlink() or (data[name].exists() and getattr(data[name].lstat(), "st_file_attributes", 0) & 0x400):
             raise ValueError("Recovery does not follow links")
     app = data["install_dir"]
-    if (data["candidate"] != app.parent / (".CreatorHub-next-" + attempt)
-            or data["previous"] != app.parent / (".CreatorHub-previous-" + attempt)
+    if (data["candidate"] != app.parent / (".mmm-next-" + attempt)
+            or data["previous"] != app.parent / (".mmm-previous-" + attempt)
             or Path(home).resolve().is_relative_to(app.resolve())):
         raise ValueError("Recovery paths are outside the installation transaction")
     return data
@@ -130,7 +130,7 @@ def rollback(home, journal):
     app, previous = journal["install_dir"], journal["previous"]
     if previous.is_dir():
         if app.exists():
-            failed = app.parent / (".CreatorHub-failed-" + journal["attempt"])
+            failed = app.parent / (".mmm-failed-" + journal["attempt"])
             if failed.exists():
                 raise ValueError("Recovery destination already exists")
             app.rename(failed)
@@ -160,8 +160,8 @@ def update_display_version(data):
 def apply_delta(data, environment):
     manifest = load_delta(data)
     app, attempt = data["install_dir"], data["attempt"]
-    candidate = app.parent / (".CreatorHub-next-" + attempt)
-    previous = app.parent / (".CreatorHub-previous-" + attempt)
+    candidate = app.parent / (".mmm-next-" + attempt)
+    previous = app.parent / (".mmm-previous-" + attempt)
     if candidate.exists() or previous.exists():
         raise ValueError("Update attempt has already staged or replaced files")
     prior = read_journal(data["home"])

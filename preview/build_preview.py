@@ -29,7 +29,7 @@ def build_guide(destination: Path) -> None:
         shutil.copy2(ROOT / "assets" / "screenshots" / name, images / name)
     platforms = json.loads((GUIDE / "platforms.json").read_text(encoding="utf-8"))
     for slug, platform in platforms.items():
-        if slug not in {"douyin", "xhs", "kuaishou", "shipinhao"}:
+        if slug not in {"douyin", "xhs", "kuaishou", "tiktok", "shipinhao"}:
             raise ValueError(f"Unknown documentation platform: {slug}")
         chapters = []
         for feature in platform["features"]:
@@ -41,9 +41,9 @@ def build_guide(destination: Path) -> None:
         toc = ''.join(f'<a href="#{escape(item["anchor"])}">{escape(item["title"])}</a>' for item in platform['features'])
         name = escape(platform['name'])
         html = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>{name}使用指南 · CreatorHub</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{name}使用指南 · mmm</title>
 <meta name="description" content="{escape(platform['intro'])}"><link rel="stylesheet" href="../guide.css"></head><body>
-<a class="skip" href="#main">跳到正文</a><header class="topbar"><a class="brand" href="../">CreatorHub <span>使用指南</span></a><nav aria-label="平台指南">{links}</nav></header>
+<a class="skip" href="#main">跳到正文</a><header class="topbar"><a class="brand" href="../">mmm <span>使用指南</span></a><nav aria-label="平台指南">{links}</nav></header>
 <div class="layout"><aside><nav class="toc" aria-label="本页目录"><p>{name}入门</p><a href="#start">登录与第一个任务</a>{toc}<p>通用帮助</p><a href="../#install">安装与启动</a><a href="../#notifications">通知设置</a><a href="../#queue">任务队列与风控</a><a href="../#backup">更新与备份</a><a href="../#faq">常见问题</a><a href="../">全部功能手册</a></nav></aside>
 <main id="main"><section id="start"><div class="eyebrow">PLATFORM GUIDE</div><h1>{name}使用指南</h1><p class="lead">{escape(platform['intro'])}</p>
 <div class="note">真实操作需要本地运行。还没装好？先看<a href="../#install">安装教程</a>。</div>

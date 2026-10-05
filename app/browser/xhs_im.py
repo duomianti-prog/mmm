@@ -124,7 +124,7 @@ def parse_conversations(chats_payload: Any, unread_payload: Any = None) -> list[
 
 
 def parse_history(payload: Any, *, peer_uid: str = "", self_uid: str = "") -> dict:
-    """Normalize the Web history payload to CreatorHub's existing DM schema."""
+    """Normalize the Web history payload to mmm's existing DM schema."""
     root = _dict(payload)
     data = _dict(root.get("data"))
     rows = _list(data.get("out_message_list") or data.get("message_list"))

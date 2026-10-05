@@ -1,4 +1,4 @@
-"""CreatorHub-owned stable Chrome processes for Xiaohongshu CDP sessions."""
+"""mmm-owned stable Chrome processes for Xiaohongshu CDP sessions."""
 from __future__ import annotations
 
 import asyncio
@@ -210,7 +210,7 @@ def chrome_launch_args(
         "--no-first-run",
         "--no-default-browser-check",
         # A managed session is occasionally recycled after being idle.  If an
-        # older CreatorHub build had to terminate Chrome before it finished
+        # older mmm build had to terminate Chrome before it finished
         # flushing the profile, do not keep showing Chrome's "restore pages"
         # bubble on every later background launch.
         "--disable-session-crashed-bubble",
@@ -455,7 +455,7 @@ class CdpProxyAuthController:
 
 
 class XhsCdpBackend:
-    """Launch and connect to one CreatorHub-owned Chrome per account."""
+    """Launch and connect to one mmm-owned Chrome per account."""
 
     def __init__(
             self, playwright: Any, profiles_root: str,
@@ -497,7 +497,7 @@ class XhsCdpBackend:
             profile_dir, Path(executable).resolve(), proxy_plan)
         if recovered is not None:
             return recovered
-        # 外部打开的浏览器（或没有所有者标记的旧版 CreatorHub 进程）仍可能
+        # 外部打开的浏览器（或没有所有者标记的旧版 mmm 进程）仍可能
         # 占用该 Profile。Chrome 会将每次启动转发给它并退出，因此在创建进程
         # 前直接报冲突，避免不断累积空白标签页。
         if profile_is_locked(profile_dir):
@@ -683,7 +683,7 @@ class XhsCdpBackend:
                     marker_path.unlink()
             return None
 
-        # An authenticated SOCKS relay lives only in the old CreatorHub
+        # An authenticated SOCKS relay lives only in the old mmm
         # process. Reusing that Chrome would retain a dead loopback proxy.
         if proxy_plan is not None and (
                 proxy_plan.scheme == "socks5" and proxy_plan.authenticated):

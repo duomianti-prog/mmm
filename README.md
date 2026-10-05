@@ -1,12 +1,12 @@
-# CreatorHub
+# mmm
 
-> 本地运行的多平台内容管理面板，支持 **抖音 / 小红书 / 快手 / 视频号**。
+> 本地运行的多平台内容管理面板，支持 **抖音 / 小红书 / 快手 / TikTok / 视频号**。
 
 [新手使用指南](https://3441293738.github.io/creatorhub/guide/) · [在线预览](https://3441293738.github.io/creatorhub/) · [快速开始](#快速开始) · [平台能力](#平台能力) · [基本使用](#基本使用) · [配置](#配置) · [常见问题](#常见问题) · [交流群](#交流群)
 
 > 在线预览由 GitHub Pages 提供，使用脱敏示例数据，仅展示界面与交互；登录、抓取、下载和发布仍需在本地运行。
 
-CreatorHub 使用 Python + FastAPI 提供统一 Web 界面，用于管理账号、监控作品与评论、下载内容、发布作品和接收通知。账号登录态、数据库及媒体文件均保存在本地。
+mmm 使用 Python + FastAPI 提供统一 Web 界面，用于管理账号、监控作品与评论、下载内容、发布作品和接收通知。账号登录态、数据库及媒体文件均保存在本地。
 
 浏览器交互按平台使用系统 Chrome CDP 或免费开源的 [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright)，业务层统一使用兼容的 Playwright API。每个账号使用独立的浏览器 Profile，Cookie、缓存和本地存储互不共享。
 
@@ -14,18 +14,18 @@ CreatorHub 使用 Python + FastAPI 提供统一 Web 界面，用于管理账号�
 
 ## 平台能力
 
-| 功能 | 抖音 | 小红书 | 快手 | 视频号 |
-|---|:---:|:---:|:---:|:---:|
-| 登录 | 扫码 / 创作者 / Cookie | 扫码 / 创作者 | 扫码 / 创作者 | 扫码 |
-| 关键词批量采集 | ✅ 作品 / 评论 / 媒体 | 规划中 | — | — |
-| 作品监控 | ✅ | ✅ 创作者 / 关键词 | ✅ | 仅本账号 |
-| 评论监控 | ✅ | ✅ | ✅ | 仅本账号 |
-| 短视频弹幕监控 | ✅ 播放页 / 创作中心 | — | — | — |
-| 内容下载 | ✅ 可选画质 | ✅ 图集 / 视频 | ✅ | — |
-| 发布 | ✅ | ✅ | ✅ | ✅ |
-| 自动评论 / 回复 | ✅ | ✅ | ✅ | — |
-| 本账号管理 | 作品 / 关注 / 粉丝 / 私信 | 作品 / 关注 / 粉丝 / 私信 | 作品 / 关注 / 粉丝 | 作品 / 数据 / 评论 |
-| 通知 | Bark / 钉钉 / Telegram | Bark / 钉钉 / Telegram | Bark / 钉钉 / Telegram | Bark / 钉钉 / Telegram |
+| 功能 | 抖音 | 小红书 | 快手 | TikTok | 视频号 |
+|---|:---:|:---:|:---:|:---:|:---:|
+| 登录 | 扫码 / 创作者 / Cookie | 扫码 / 创作者 | 扫码 / 创作者 | Cookie | 扫码 |
+| 关键词批量采集 | ✅ 作品 / 评论 / 媒体 | 规划中 | — | ✅ | — |
+| 作品监控 | ✅ | ✅ 创作者 / 关键词 | ✅ | ✅ | 仅本账号 |
+| 评论监控 | ✅ | ✅ | ✅ | ✅ | 仅本账号 |
+| 短视频弹幕监控 | ✅ 播放页 / 创作中心 | — | — | — | — |
+| 内容下载 | ✅ 可选画质 | ✅ 图集 / 视频 | ✅ | ✅ | — |
+| 发布 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 自动评论 / 回复 | ✅ | ✅ | ✅ | ✅ | — |
+| 本账号管理 | 作品 / 关注 / 粉丝 / 私信 | 作品 / 关注 / 粉丝 / 私信 | 作品 / 关注 / 粉丝 | 作品 / 关注 / 粉丝 / 私信 | 作品 / 数据 / 评论 |
+| 通知 | Bark / 钉钉 / Telegram | Bark / 钉钉 / Telegram | Bark / 钉钉 / Telegram | Bark / 钉钉 / Telegram | Bark / 钉钉 / Telegram |
 
 > 视频号只支持创作者助手中的本账号数据，不支持监控或下载他人作品。
 
@@ -33,7 +33,7 @@ CreatorHub 使用 Python + FastAPI 提供统一 Web 界面，用于管理账号�
 
 ### Windows 安装版（推荐）
 
-1. 打开 **[Windows 安装包下载页](https://github.com/3441293738/creatorhub/releases/latest)**，在 Assets 中下载 `CreatorHub-Setup-版本-windows-x64.exe`。
+1. 打开 **[Windows 安装包下载页](https://github.com/3441293738/creatorhub/releases/latest)**，在 Assets 中下载 `mmm-Setup-版本-windows-x64.exe`。
 2. 双击安装，使用桌面快捷方式启动。无需自行安装 Python、运行构建命令或下载源码；缺少 WebView2 时安装器会自动联网安装。
 3. 点击“启动本地服务”。首次会自动下载浏览器组件，就绪后打开工作台并登录账号。
 
@@ -81,7 +81,7 @@ chmod +x start.sh
 http://127.0.0.1:8000
 ```
 
-> **小红书登录建议：** 尽量使用本机系统中已安装的稳定版 Google Chrome。CreatorHub 会优先通过 CDP 启动系统 Chrome，并为每个账号使用独立的持久化 Profile，不会读取或复用个人 Chrome 的日常 Profile；未安装 Chrome 时会自动回退到可见的 Patchright Chromium。
+> **小红书登录建议：** 尽量使用本机系统中已安装的稳定版 Google Chrome。mmm 会优先通过 CDP 启动系统 Chrome，并为每个账号使用独立的持久化 Profile，不会读取或复用个人 Chrome 的日常 Profile；未安装 Chrome 时会自动回退到可见的 Patchright Chromium。
 
 常用命令：
 
@@ -171,7 +171,7 @@ npm install
 
 - **关键词批量采集**：当前仅支持抖音；一次输入最多 20 个关键词，设置每词作品数、每作品评论数、是否包含二级评论及是否下载媒体；已结束任务支持编辑配置、保留结果去重续跑和 Excel 导出。小红书关键词批量采集尚在规划中。
 - **作品监控**：添加创作者主页、作品链接、短链或平台 ID，发现新作品后自动入库。
-- **多账号监控同一主页**：抖音、小红书、快手支持不同执行账号分别订阅同一主页，任务独立维护扫描进度、采集策略和作品记录。同账号同主页仍只允许一条任务（含已暂停任务），更换执行账号时也会检查重复；小红书关键词监控的去重规则保持不变。
+- **多账号监控同一主页**：抖音、小红书、快手、TikTok 支持不同执行账号分别订阅同一主页，任务独立维护扫描进度、采集策略和作品记录。同账号同主页仍只允许一条任务（含已暂停任务），更换执行账号时也会检查重复；小红书关键词监控的去重规则保持不变。
 - **共享下载目录**：多个任务下载同一媒体至同一路径时串行写入并复用已有文件；如需分别保存，可为任务设置不同下载目录。
 - **评论监控**：可订阅单条作品，也可监控账号近期作品的评论。
 - **短视频弹幕监控**：独立于评论区，按视频内时间轴渐进探测并排序；支持时间范围、关键词、文本长度、点赞数和容量上限过滤，记录持久化到 SQLite；自己的视频走创作中心，公开视频走播放器拦截。
@@ -187,7 +187,7 @@ npm install
 
 - 小红书支持图集、视频和定时发布。
 - 抖音、快手和视频号通过对应创作平台发布。
-- 已下载的抖音作品可转发到小红书或视频号，小红书作品可转发到抖音；发布前可修改标题、正文和话题。
+- 已下载的抖音作品可转发到小红书或视频号，小红书作品可转发到抖音，TikTok 作品可转发到抖音、小红书或视频号；发布前可修改标题、正文和话题。
 
 ### 4. 本账号与通知
 
@@ -219,10 +219,10 @@ npm install
 
 ### 可选：Fingerprint Chromium 开源内核（小红书除外）
 
-CreatorHub 可以把开源的
+mmm 可以把开源的
 [`fingerprint-chromium`](https://github.com/adryfish/fingerprint-chromium)
 作为其他平台的可插拔 Chromium 运行时。账号、Profile、Cookie、代理、LRU 和风控仍由
-CreatorHub 管理，不需要外部商业浏览器或云端账号。小红书始终使用系统 Chrome/CDP：
+mmm 管理，不需要外部商业浏览器或云端账号。小红书始终使用系统 Chrome/CDP：
 第三方指纹内核与既有 Profile 混用容易造成 UA/Client Hints、GPU 和站点持久状态不一致，
 从而增加设备安全验证；后端、登录接口和账号设置页都会拒绝该组合。
 
@@ -240,7 +240,7 @@ engine:
   fingerprint_chromium_platform: auto
 ```
 
-4. 重启 CreatorHub，在账号的「环境」设置中选择具体内核版本。
+4. 重启 mmm，在账号的「环境」设置中选择具体内核版本。
    `browser_backend: fingerprint_chromium` 可以将默认指纹内核应用到所有未单独
    指定环境的非小红书账号；小红书仍固定走系统 Chrome/CDP。
 
@@ -251,7 +251,7 @@ engine:
 按钮修改。
 
 该后端使用账号现有 `fp_seed` 生成稳定的 32 位内核指纹种子，并由浏览器内核
-统一处理 UA/Client Hints、Canvas、Audio、WebGL、语言和时区；CreatorHub 不会
+统一处理 UA/Client Hints、Canvas、Audio、WebGL、语言和时区；mmm 不会
 再叠加 `legacy` JavaScript 指纹脚本。默认强制使用有头窗口，因为上游说明无头模式
 只处理了部分无头特征。切换已有账号的浏览器环境会改变其设备画像，建议切换后重新
 检查登录态和代理出口。小红书登录和后续任务不会进入该分支，也不会在出现设备验证时
@@ -368,7 +368,7 @@ data/
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/3441293738/creatorhub/star-history/assets/star-history-dark.svg">
-  <img alt="CreatorHub Star History Chart" src="https://raw.githubusercontent.com/3441293738/creatorhub/star-history/assets/star-history.svg">
+  <img alt="mmm Star History Chart" src="https://raw.githubusercontent.com/3441293738/creatorhub/star-history/assets/star-history.svg">
 </picture>
 
 ## 使用须知
@@ -376,7 +376,7 @@ data/
 本项目用于技术学习和个人内容管理，不提供账号、Cookie、代理或平台数据。使用时请遵守目标平台规则及所在地法律法规，并尊重内容版权和个人隐私。
 ## 交流群
 
-欢迎加入 **CreatorHub 交流群**，交流使用经验、问题反馈和功能建议。
+欢迎加入 **mmm 交流群**，交流使用经验、问题反馈和功能建议。
 
 <table>
   <tr>
@@ -386,7 +386,7 @@ data/
   <tr>
     <td align="center">
       <a href="assets/community/wechat-group.jpg">
-        <img src="assets/community/wechat-group.jpg" alt="CreatorHub 交流群二维码" width="240">
+        <img src="assets/community/wechat-group.jpg" alt="mmm 交流群二维码" width="240">
       </a>
     </td>
     <td align="center">

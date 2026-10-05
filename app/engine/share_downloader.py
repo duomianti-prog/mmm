@@ -794,7 +794,7 @@ def _clean_ydl_error(message: str) -> str:
     ):
         return (
             "这是抖音图文作品；请在“复用账号登录态”中选择一个已登录的抖音账号，"
-            "CreatorHub 将通过原生抖音接口下载全部图片和作品元数据"
+            "mmm 将通过原生抖音接口下载全部图片和作品元数据"
         )
     return clean or "媒体提取失败"
 

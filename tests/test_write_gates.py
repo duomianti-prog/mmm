@@ -1304,6 +1304,110 @@ class WriteGateTests(unittest.TestCase):
                 CommentTask.rule_id == rule_id)).one()
             self.assertEqual(task.target_text, "hello from visitor")
 
+    def test_auto_comment_revives_failed_task_but_skips_done(self):
+        account_id = self._account()
+        with db.get_session() as session:
+            rule = CommentRule(
+                platform="douyin", mode="auto_comment", target_kind="others",
+                account_id=account_id, templates='["赞"]',
+                max_per_run=10, daily_cap=10, min_gap_seconds=1,
+            )
+            session.add(rule)
+            session.commit()
+            session.refresh(rule)
+            rule_id = rule.id
+            session.add(CommentTask(
+                platform="douyin", rule_id=rule_id, account_id=account_id,
+                aweme_id="work-failed", content="赞", status="failed",
+                error="网络超时", blocked_signal="network_backoff"))
+            session.add(CommentTask(
+                platform="douyin", rule_id=rule_id, account_id=account_id,
+                aweme_id="work-done", content="赞", status="done"))
+            session.commit()
+
+        engine = MonitorEngine(self.cfg, _BrowserStub())
+
+        async def discover(*_args):
+            return ([
+                {"aweme_id": "work-failed", "target_comment_id": "",
+                 "target_nick": "", "work_title": "失败作品标题",
+                 "source_text": "", "ctx": {}},
+                {"aweme_id": "work-done", "target_comment_id": "",
+                 "target_nick": "", "work_title": "已完成作品标题",
+                 "source_text": "", "ctx": {}},
+                {"aweme_id": "work-fresh", "target_comment_id": "",
+                 "target_nick": "", "work_title": "新作品标题",
+                 "source_text": "", "ctx": {}},
+            ], "")
+
+        engine._discover_targets = discover
+        result = asyncio.run(engine.run_comment_rule(rule_id))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["created"], 2)
+        self.assertEqual(result["revived"], 1)
+        with db.get_session() as session:
+            rows = {t.aweme_id: t for t in session.exec(select(CommentTask).where(
+                CommentTask.rule_id == rule_id)).all()}
+        self.assertEqual(set(rows), {"work-failed", "work-done", "work-fresh"})
+        self.assertEqual(rows["work-failed"].status, "pending")
+        self.assertEqual(rows["work-failed"].error, "")
+        self.assertEqual(rows["work-failed"].blocked_signal, "")
+        self.assertEqual(rows["work-failed"].work_title, "失败作品标题")
+        self.assertEqual(rows["work-done"].status, "done")
+        self.assertEqual(rows["work-fresh"].status, "pending")
+        self.assertEqual(rows["work-fresh"].work_title, "新作品标题")
+
+    def test_manual_rule_run_bypasses_soft_pacing_but_keeps_cooldown(self):
+        """界面「试跑」(manual) 越过操作节奏软节流;硬风控冷却期仍拦截。"""
+        account_id = self._account()
+        with db.get_session() as session:
+            rule = CommentRule(
+                platform="douyin", mode="auto_comment", target_kind="creator",
+                sec_uid="sec-creator", account_id=account_id,
+                templates='["赞"]',
+                max_per_run=5, daily_cap=20, min_gap_seconds=1)
+            session.add(rule)
+            session.commit()
+            session.refresh(rule)
+            rule_id = rule.id
+
+        engine = MonitorEngine(self.cfg, _BrowserStub())
+
+        async def discover(*_args):
+            return ([{"aweme_id": "w1", "target_comment_id": "",
+                      "target_nick": "", "work_title": "新作品",
+                      "source_text": "", "ctx": {}}], "")
+
+        engine._discover_targets = discover
+
+        with db.get_session() as session:
+            session.add(AccountRiskState(
+                account_id=account_id,
+                operation_not_before=datetime.utcnow() + timedelta(hours=1)))
+            session.commit()
+
+        # 定时调度:操作节奏未到,跳过发现
+        blocked = asyncio.run(engine.run_comment_rule(rule_id))
+        self.assertFalse(blocked["ok"])
+        self.assertTrue(blocked.get("skipped"))
+
+        # 用户点「试跑」:软节奏放行,正常生成任务
+        manual = asyncio.run(engine.run_comment_rule(rule_id, manual=True))
+        self.assertTrue(manual["ok"], manual)
+        self.assertEqual(manual["created"], 1)
+
+        # 硬风控(冷却期)即使手动也保留
+        with db.get_session() as session:
+            state = session.get(AccountRiskState, account_id)
+            state.operation_not_before = None
+            state.cooldown_until = datetime.utcnow() + timedelta(hours=1)
+            session.add(state)
+            session.commit()
+        hard = asyncio.run(engine.run_comment_rule(rule_id, manual=True))
+        self.assertFalse(hard["ok"])
+        self.assertIn("冷却", hard["error"])
+
     def test_concurrent_comment_rule_discovery_rechecks_read_budget_in_lock(self):
         account_id = self._account()
         rule_ids = []

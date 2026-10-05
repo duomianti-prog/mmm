@@ -5,6 +5,17 @@ No server, file access or task execution here; lifecycle remains in launcher.py.
 import tkinter as tk
 from tkinter import ttk
 
+# 自定义品牌：data/branding/logo.* 与 name.txt 存在时覆盖默认。
+def _custom_brand_name() -> str:
+    try:
+        from app.branding import read_name
+        return read_name()
+    except Exception:
+        return "mmm"
+
+
+BRAND_NAME = _custom_brand_name()
+
 COLORS = {
     "bg": "#f5f5f7", "surface": "#ffffff", "fg": "#333338",
     "strong": "#1d1d1f", "muted": "#616169", "line": "#d6d6dc",
@@ -15,15 +26,50 @@ COLORS = {
 
 
 def brand_image(size=64):
-    """Rasterize the existing magnifier mark for native titlebar/tray/EXE icons."""
-    from PIL import Image, ImageDraw
+    """返回品牌图。优先使用 data/branding/ 下的自定义 Logo，否则绘制默认 mmm 字母标。"""
+    from PIL import Image, ImageDraw, ImageFont
+    custom = None
+    try:
+        from app.branding import find_logo
+        path = find_logo()
+        if path is not None and path.suffix.lower() != ".svg":
+            custom = Image.open(path).convert("RGBA")
+    except Exception:
+        custom = None
+    if custom is not None:
+        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        custom.thumbnail((size, size), Image.Resampling.LANCZOS)
+        offset = ((size - custom.width) // 2, (size - custom.height) // 2)
+        canvas.paste(custom, offset, custom)
+        return canvas
     image = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((2, 2, 254, 254), radius=54, fill="#ffffff")
-    draw.ellipse((38, 34, 190, 186), outline="#25c9ce", width=14)
-    draw.ellipse((54, 34, 206, 186), outline=COLORS["accent"], width=14)
-    draw.ellipse((102, 82, 157, 137), outline=COLORS["accent"], width=12)
-    draw.line((183, 174, 223, 220), fill=COLORS["accent"], width=16)
+    # 深色圆角底 + 白色粗体 mmm，与 frontend/brand.svg 同形。
+    draw.rounded_rectangle((10, 10, 246, 246), radius=58, fill="#1d1d1f",
+                           outline=(255, 255, 255, 56), width=2)
+    font = None
+    for candidate in (r"C:\Windows\Fonts\arialbd.ttf", r"C:\Windows\Fonts\segoeuib.ttf"):
+        try:
+            for size in range(104, 59, -2):
+                probe = ImageFont.truetype(candidate, size)
+                box = draw.textbbox((0, 0), "mmm", font=probe)
+                if box[2] - box[0] <= 214:
+                    font = probe
+                    break
+            if font is not None:
+                break
+        except OSError:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+    text = "mmm"
+    try:
+        left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+        w, h = right - left, bottom - top
+        draw.text(((256 - w) / 2 - left, (256 - h) / 2 - top - 6), text,
+                  font=font, fill="#ffffff")
+    except Exception:
+        draw.text((78, 78), text, font=font, fill="#ffffff")
     return image.resize((size, size), Image.Resampling.LANCZOS)
 
 
@@ -114,7 +160,7 @@ class LauncherView:
     def __init__(self, owner, version):
         self.owner = owner
         root = owner.root
-        root.title("CreatorHub · 启动管理器")
+        root.title(f"{BRAND_NAME} · 启动管理器")
         root.geometry("840x670")
         root.minsize(780, 650)
         configure_styles(root)
@@ -135,7 +181,7 @@ class LauncherView:
         mark.create_oval(9, 5, 39, 35, outline=COLORS["accent"], width=3)
         mark.create_oval(18, 15, 29, 26, outline=COLORS["accent"], width=2)
         mark.create_line(34, 32, 44, 43, fill=COLORS["accent"], width=3)
-        ttk.Label(header, text="CreatorHub", style="Title.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Label(header, text=BRAND_NAME, style="Title.TLabel").grid(row=0, column=1, sticky="w")
         ttk.Label(header, text="启动管理器  /  你的本地内容工作台", style="Subtitle.TLabel").grid(row=1, column=1, sticky="w")
         ttk.Label(header, text=f"桌面版 {version}", style="Idle.TLabel").grid(row=0, column=2, rowspan=2)
 

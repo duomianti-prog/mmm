@@ -29,7 +29,7 @@ class ImReceiverManager:
     async def subscribe(self, account_id: int) -> asyncio.Queue:
         st = self._accts.get(account_id)
         if not st:
-            st = {"task": None, "queues": set(), "uid": ""}
+            st = {"task": None, "queues": set(), "uid": "", "sec_uid": ""}
             self._accts[account_id] = st
         q: asyncio.Queue = asyncio.Queue(maxsize=100)
         st["queues"].add(q)
@@ -75,7 +75,7 @@ class ImReceiverManager:
 
     async def _run(self, account_id: int):
         # 等 uid(允许"先开面板后同步"):最多轮询 ~30s 读 DB,同步存下 uid 即自愈
-        uid, identity = "", None
+        uid, sec_uid, identity = "", "", None
         for _ in range(15):
             with get_session() as s:
                 acc = s.get(DouyinAccount, account_id)
@@ -83,8 +83,13 @@ class ImReceiverManager:
                     print(f"[im-ws] _run account={account_id} 非抖音/不存在,跳过")
                     return
                 uid = acc.uid
+                sec_uid = acc.sec_uid or ""
                 identity = self.browser.identity_for(acc)
             if uid:
+                st0 = self._accts.get(account_id)
+                if st0 is not None:
+                    st0["uid"] = uid
+                    st0["sec_uid"] = sec_uid
                 break
             st = self._accts.get(account_id)
             if not st or not st["queues"]:      # 订阅者都走了就别等了
@@ -117,6 +122,8 @@ class ImReceiverManager:
         mid = m.get("server_msg_id") or ""
         direction = "out" if m.get("is_self") else "in"
         ts = int(m.get("create_time") or 0)
+        peer_nickname = ""
+        dedup_id = mid or f"ws:{ts}:{m.get('sender_uid')}"
         try:
             with get_session() as s:
                 if mid:
@@ -125,7 +132,7 @@ class ImReceiverManager:
                         DmMessage.msg_id == mid)).first()
                     if exists:
                         return
-                # 删掉该会话的 last:<conv> 占位(实时消息更权威)
+                # 删掉该会话的 last:<conv_id> 占位(实时消息更权威)
                 ph = s.exec(select(DmMessage).where(
                     DmMessage.account_id == account_id,
                     DmMessage.msg_id == "last:" + conv_id)).first()
@@ -134,8 +141,7 @@ class ImReceiverManager:
                 card = m.get("card")
                 s.add(DmMessage(
                     platform="douyin", account_id=account_id, conv_id=conv_id,
-                    msg_id=mid or f"ws:{ts}:{m.get('sender_uid')}",
-                    direction=direction, msg_type=("video" if card else "text"),
+                    msg_id=dedup_id, direction=direction, msg_type=("video" if card else "text"),
                     text=m.get("text") or "", create_time=ts,
                     raw_json=json.dumps(card, ensure_ascii=False) if card else ""))
                 conv = s.exec(select(DmConversation).where(
@@ -146,10 +152,27 @@ class ImReceiverManager:
                     conv.last_time = ts or conv.last_time
                     if direction == "in":
                         conv.unread_count = (conv.unread_count or 0) + 1
+                    peer_nickname = conv.peer_nickname or ""
                     s.add(conv)
                 s.commit()
         except Exception as e:
             print(f"[im-ws] 入库失败: {e!r}")
+        # 入站消息汇入客服统一总线：按账号接待开关自动建档/镜像（幂等、
+        # 坐席不在线也照常入库），重复投递由总线去重
+        if direction == "in":
+            try:
+                from ..cs import inbound as cs_inbound
+                st_meta = self._accts.get(account_id) or {}
+                cs_inbound.ingest_dm(
+                    platform="douyin", account_id=account_id,
+                    account_key=st_meta.get("sec_uid", ""),
+                    thread_key=conv_id, text=m.get("text") or "",
+                    platform_msg_id=dedup_id,
+                    peer_uid=str(m.get("peer_uid") or ""),
+                    peer_nickname=peer_nickname, msg_ts=ts,
+                    cursor=str(ts or dedup_id))
+            except Exception as e:
+                print(f"[im-ws] 客服联动失败（不影响私信）: {e!r}")
         # 推给 SSE 订阅者
         st = self._accts.get(account_id)
         if st:

@@ -41,6 +41,7 @@ from .browser import (BrowserManager, cookie_string_to_state,
                       fetch_channels_self_profile,
                       fetch_account_works, fetch_follows, fetch_dm_conversations,
                       fetch_dm_history, fetch_douyin_account_works_api)
+from .platforms.tiktok import fetch_tiktok_dm_conversations
 from .browser.backends import (
     ACCOUNT_BROWSER_BACKENDS, LOCAL_BACKEND, fingerprint_seed_u32,
     parse_extra_launch_args,
@@ -78,7 +79,20 @@ from .platforms.kuaishou import (resolve_ks_user_id, resolve_ks_photo_id,
                   parse_self_user as parse_ks_self_user,
                   MANAGE_URL as KS_MANAGE_URL)
 from .platforms.channels import parse_self_user as parse_channels_self_user
+from .platforms import registry as platforms
+# 导入 TikTok 适配包即完成自注册(网络闸门/登录/体检等)
+from .platforms import tiktok as _tiktok_platform  # noqa: F401
+from .platforms.tiktok import (
+    fetch_tiktok_self_profile,
+    fetch_tiktok_share_item,
+    interactive_tiktok_login,
+    parse_tiktok_handle,
+    parse_tiktok_item,
+    parse_tiktok_item_url,
+    parse_tiktok_self_user,
+)
 from .engine import Downloader, MonitorEngine
+from .engine.monitor import AccountBusyError
 from .engine.share_downloader import (
     clean_platform_share_target,
     ShareDownloadError,
@@ -132,6 +146,9 @@ cfg = load_config()
 browser: BrowserManager | None = None
 engine: MonitorEngine | None = None
 im_receiver = None      # ImReceiverManager(私信实时接收)
+cs_node_worker = None   # RelayNodeWorker(跨节点客服回投认领)
+# 客服子系统：在 init_db 的 create_all 之前把 Cs* 表注册到 SQLModel.metadata
+from .cs import models as _cs_models  # noqa: E402,F401
 login_tasks: Dict[str, dict] = {}
 # 用户手动打开的账号浏览器窗口(account_id -> BrowserContext),留引用防 GC、便于复用/清理
 open_browsers: Dict[int, Any] = {}
@@ -173,12 +190,7 @@ def _active_open_browser_account_ids() -> list[int]:
 
 
 def _login_scope_label(platform: str, creator: bool) -> str:
-    label = {
-        "xhs": "小红书",
-        "kuaishou": "快手",
-        "shipinhao": "视频号",
-        "douyin": "抖音",
-    }.get(platform, platform or "平台")
+    label = platforms.label_of(platform, platform or "平台")
     return f"{label}创作者" if creator else label
 
 
@@ -494,6 +506,35 @@ async def lifespan(app: FastAPI):
             print(f"[startup] 已为 {n} 个存量账号补齐画像(profile/UA/指纹/代理)")
     except Exception as e:
         print(f"[startup] 账号画像迁移失败(不影响启动): {e!r}")
+    # 启动时清除风控残留状态:这些状态是上个会话中单任务触发的,跨重启不应
+    # 永久阻塞整号。全部清零,让账号以干净状态重新开始。
+    try:
+        with get_session() as session:
+            cleared = 0
+            for rstate in session.exec(select(AccountRiskState)).all():
+                if (rstate.manual_review_required or rstate.cooldown_until
+                        or rstate.probe_only_until or rstate.retry_not_before
+                        or rstate.risk_level):
+                    rstate.manual_review_required = False
+                    rstate.manual_review_reason = ""
+                    rstate.cooldown_until = None
+                    rstate.probe_only_until = None
+                    rstate.retry_not_before = None
+                    rstate.risk_level = 0
+                    rstate.consecutive_risk = 0
+                    cleared += 1
+                    session.add(rstate)
+            for acc in session.exec(select(DouyinAccount)).all():
+                if acc.write_paused_until:
+                    acc.write_paused_until = None
+                    acc.write_pause_reason = ""
+                    session.add(acc)
+            if cleared:
+                session.commit()
+                print(f"[startup] 已清除 {cleared} 个账号的风控残留状态"
+                      f"(验证/冷却/恢复期/退避/写暂停)")
+    except Exception as e:
+        print(f"[startup] 风控残留状态清理失败(不影响启动): {e!r}")
     try:
         runtime_specs = _seed_browser_runtimes()
     except Exception as e:
@@ -502,60 +543,298 @@ async def lifespan(app: FastAPI):
     default_runtime_id = next(
         (item["runtime_id"] for item in runtime_specs
          if item.get("is_default") and item.get("enabled")), "")
-    browser = BrowserManager(
-        cfg.engine.user_agent, cfg.engine.profiles_dir,
-        cfg.engine.max_live_contexts, native_ua_callback=_persist_native_ua,
-        xhs_browser_mode=cfg.engine.xhs_browser_mode,
-        xhs_cdp_idle_seconds=cfg.engine.xhs_cdp_idle_seconds,
-        resident_sessions=cfg.engine.resident_browser_sessions,
-        session_idle_seconds=cfg.engine.browser_session_idle_seconds,
-        native_write_gate_enabled=cfg.engine.native_write_gate_enabled,
-        native_write_require_system_chrome=cfg.engine.native_write_require_system_chrome,
-        native_write_require_verified_proxy=cfg.engine.native_write_require_verified_proxy,
-        native_write_proxy_max_age_seconds=cfg.engine.native_write_proxy_max_age_seconds,
-        browser_exit_probe_url=cfg.engine.browser_exit_probe_url,
-        browser_backend=cfg.engine.browser_backend,
-        fingerprint_chromium_path=(
-            "" if runtime_specs else cfg.engine.fingerprint_chromium_path),
-        fingerprint_chromium_allow_headless=(
-            cfg.engine.fingerprint_chromium_allow_headless),
-        fingerprint_chromium_platform=(
-            cfg.engine.fingerprint_chromium_platform),
-        fingerprint_chromium_runtimes=runtime_specs,
-        fingerprint_default_runtime_id=default_runtime_id)
-    await browser.start()
-    engine = MonitorEngine(cfg, browser)
-    startup_now = datetime.utcnow()
-    pruned_risk_events = engine._prune_risk_events_if_due(startup_now)
-    if pruned_risk_events:
-        print(f"[startup] 已清理 {pruned_risk_events} 条过期风控事件")
-    recovered = engine.recover_interrupted_tasks()
-    if recovered:
-        print(f"[startup] 已恢复 {recovered} 条中断的写任务")
-    engine.start()
-    from .engine.im_receiver import ImReceiverManager
-    im_receiver = ImReceiverManager(browser)
-    publisher = getattr(im_receiver, "publish", None)
-    if callable(publisher):
-        engine.set_dm_event_sink(publisher)
+    stack_started = False
+
+    async def start_stack():
+        global browser, engine, im_receiver, cs_node_worker
+        browser = BrowserManager(
+            cfg.engine.user_agent, cfg.engine.profiles_dir,
+            cfg.engine.max_live_contexts, native_ua_callback=_persist_native_ua,
+            xhs_browser_mode=cfg.engine.xhs_browser_mode,
+            xhs_cdp_idle_seconds=cfg.engine.xhs_cdp_idle_seconds,
+            resident_sessions=cfg.engine.resident_browser_sessions,
+            session_idle_seconds=cfg.engine.browser_session_idle_seconds,
+            native_write_gate_enabled=cfg.engine.native_write_gate_enabled,
+            native_write_require_system_chrome=cfg.engine.native_write_require_system_chrome,
+            native_write_require_verified_proxy=cfg.engine.native_write_require_verified_proxy,
+            native_write_proxy_max_age_seconds=cfg.engine.native_write_proxy_max_age_seconds,
+            browser_exit_probe_url=cfg.engine.browser_exit_probe_url,
+            browser_backend=cfg.engine.browser_backend,
+            fingerprint_chromium_path=(
+                "" if runtime_specs else cfg.engine.fingerprint_chromium_path),
+            fingerprint_chromium_allow_headless=(
+                cfg.engine.fingerprint_chromium_allow_headless),
+            fingerprint_chromium_platform=(
+                cfg.engine.fingerprint_chromium_platform),
+            fingerprint_chromium_runtimes=runtime_specs,
+            fingerprint_default_runtime_id=default_runtime_id)
+        await browser.start()
+        engine = MonitorEngine(cfg, browser)
+        startup_now = datetime.utcnow()
+        pruned_risk_events = engine._prune_risk_events_if_due(startup_now)
+        if pruned_risk_events:
+            print(f"[startup] 已清理 {pruned_risk_events} 条过期风控事件")
+        recovered = engine.recover_interrupted_tasks()
+        if recovered:
+            print(f"[startup] 已恢复 {recovered} 条中断的写任务")
+        engine.start()
+        from .engine.im_receiver import ImReceiverManager
+        im_receiver = ImReceiverManager(browser)
+        publisher = getattr(im_receiver, "publish", None)
+        if callable(publisher):
+            engine.set_dm_event_sink(publisher)
+        # 跨节点客服回投：启用后认领云客服服务器上的待回投任务，用本机登录态执行
+        from .cs.node_worker import RelayNodeWorker
+        cs_node_worker = RelayNodeWorker()
+        cs_node_worker.start()
+
+    async def stop_stack():
+        global browser, engine, im_receiver, cs_node_worker
+        follow_tasks = [task for task in _follow_sync_tasks.values()
+                        if not task.done()]
+        for task in follow_tasks:
+            task.cancel()
+        if follow_tasks:
+            await asyncio.gather(*follow_tasks, return_exceptions=True)
+        if cs_node_worker:
+            await cs_node_worker.stop()
+        if im_receiver:
+            await im_receiver.stop_all()
+        if engine:
+            await engine.stop()
+        if browser:
+            await browser.stop()
+        im_receiver = None
+        engine = None
+        browser = None
+        cs_node_worker = None
+
+    # ── 授权门控：无有效授权时不启动浏览器/采集引擎，仅提供授权提示页 ──
+    from . import license_core
+    # 云服务器客服模式（python -m app.cs_server）：只跑客服 IM，不启动浏览器/采集引擎
+    cs_only = bool(os.environ.get("MMM_CS_ONLY"))
+    watcher = None
+    if cs_only:
+        print("[startup] 客服服务器模式（MMM_CS_ONLY）：不启动浏览器/采集引擎。")
+    elif license_core.gate_passed():
+        await start_stack()
+        stack_started = True
+    else:
+        _info = license_core.evaluate()
+        print(f"[startup] 授权未通过（{_info['status_text']}）："
+              "不启动采集引擎，仅显示授权提示页。")
+
+    async def _license_watcher():
+        # 阻塞时每 5 秒寻找新授权；运行时每 60 秒检查到期，失效即停引擎。
+        nonlocal stack_started
+        blocked = not stack_started
+        while True:
+            await asyncio.sleep(5 if blocked else 60)
+            try:
+                ok = license_core.gate_passed()
+            except Exception:
+                continue
+            if blocked and ok:
+                try:
+                    await start_stack()
+                    stack_started = True
+                    print("[startup] 检测到有效授权，采集引擎已启动。")
+                    blocked = False
+                except Exception as e:
+                    print(f"[startup] 授权通过但引擎启动失败(不影响页面): {e!r}")
+            elif not blocked and not ok:
+                print("[startup] 授权已失效，停止采集引擎。")
+                await stop_stack()
+                stack_started = False
+                blocked = True
+
+    if not cs_only:
+        watcher = asyncio.create_task(_license_watcher())
     yield
-    follow_tasks = [task for task in _follow_sync_tasks.values()
-                    if not task.done()]
-    for task in follow_tasks:
-        task.cancel()
-    if follow_tasks:
-        await asyncio.gather(*follow_tasks, return_exceptions=True)
-    if im_receiver:
-        await im_receiver.stop_all()
-    if engine:
-        await engine.stop()
-    if browser:
-        await browser.stop()
+    if watcher:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+    if stack_started:
+        await stop_stack()
 
 
-app = FastAPI(title="CreatorHub", lifespan=lifespan)
+app = FastAPI(title="mmm", lifespan=lifespan)
+
+
+@app.get("/api/platforms")
+async def platforms_catalog():
+    """平台目录:前端平台 tab、账号平台选项与功能门统一由该清单驱动。
+
+    返回注册顺序的平台行,每行含显示名、能力标志集合与 enabled 状态;
+    enabled=false 的平台已登记但暂不开放,前端需隐藏入口。
+    """
+    return platforms.catalog()
+from .license_gate import LicenseGateMiddleware  # noqa: E402
+app.add_middleware(LicenseGateMiddleware)
 app.add_middleware(LocalAccessMiddleware)
+
+
+class _CsCorsMiddleware:
+    """仅对客服路径(/api/cs/*、/chat/*)放开跨域。
+
+    桌面工作台(WebView2, 本地回环 origin)可直连远程客服服务器；
+    其他 API 仍由 LocalAccessMiddleware 做回环+同源保护，不受影响。
+    """
+
+    def __init__(self, asgi_app):
+        self.app = asgi_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        if not (path.startswith("/api/cs/") or path.startswith("/chat/")):
+            await self.app(scope, receive, send)
+            return
+        if scope["method"] == "OPTIONS":
+            from starlette.responses import Response
+            # 回显浏览器请求放行的自定义头：工作台全局 fetch 恒带
+            # X-CreatorHub-Actor，风险管理请求还会带 X-CreatorHub-Admin-Token；
+            # 漏放任一头，预检虽 204，实际 POST 仍会被浏览器拦截(failed to fetch)。
+            req_headers = ""
+            for k, v in scope.get("headers", []):
+                if k == b"access-control-request-headers":
+                    req_headers = v.decode("latin-1")
+                    break
+            r = Response(status_code=204)
+            r.headers["Access-Control-Allow-Origin"] = "*"
+            r.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+            r.headers["Access-Control-Allow-Headers"] = (
+                req_headers
+                or "Authorization, Content-Type, X-CreatorHub-Actor, "
+                   "X-CreatorHub-Admin-Token")
+            r.headers["Access-Control-Max-Age"] = "86400"
+            await r(scope, receive, send)
+            return
+        async def send_with_cors(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers") or [])
+                headers.append((b"access-control-allow-origin", b"*"))
+                message = dict(message, headers=headers)
+            await send(message)
+        await self.app(scope, receive, send_with_cors)
+
+
+app.add_middleware(_CsCorsMiddleware)
+# 客服子系统路由（访客 /chat、坐席 /api/cs/*）
+from .cs.api import router as _cs_router  # noqa: E402
+from .cs.relay import set_engine_getter as _cs_set_engine_getter  # noqa: E402
+app.include_router(_cs_router)
+_cs_set_engine_getter(lambda: engine)   # 运行时取全局 engine（None=纯客服节点）
 WEB_DIR = Path(__file__).parent / "web"
+
+
+class CsNodeConfigIn(BaseModel):
+    enabled: bool | None = None
+    url: str | None = None
+    token: str | None = None
+    lan_enabled: bool | None = None
+    lan_port: int | None = None
+
+
+@app.get("/api/cs/node-config")
+async def get_cs_node_config():
+    from .cs.node_worker import node_config
+    return node_config()
+
+
+@app.put("/api/cs/node-config")
+async def put_cs_node_config(body: CsNodeConfigIn):
+    from .cs import node_worker
+    node_worker.save_node_config(enabled=body.enabled, url=body.url,
+                                 token=body.token,
+                                 lan_enabled=body.lan_enabled,
+                                 lan_port=body.lan_port)
+    probe = None
+    # 保存启用时顺带做一次连通性自检，让用户立刻知道令牌/地址是否正确
+    cfg = node_worker.node_config()
+    if cfg["enabled"] and cfg["url"] and cfg["has_token"]:
+        from .settings import get_setting
+        probe = await node_worker.probe_node_connection(
+            cfg["url"], get_setting(node_worker.SET_TOKEN, ""))
+    return {"config": cfg, "probe": probe}
+
+
+# ─────────── 可替换品牌资源（Logo / 产品名） ───────────
+from .branding import branding_dir, branding_payload, DEFAULT_NAME  # noqa: E402
+from . import license_core  # noqa: E402
+
+
+@app.get("/api/license/status")
+def license_status():
+    """授权状态（授权失效时此接口仍然放行，供提示页轮询）。"""
+    info = license_core.evaluate()
+    return {
+        "status": info["status"],
+        "status_text": info["status_text"],
+        "customer": info.get("customer") or "",
+        "expire_at": info.get("expire_at") or 0,
+        "days_remaining": info.get("days_remaining"),
+        "perpetual": bool(info.get("perpetual")),
+        "warn_days": info.get("warn_days", 7),
+        "fingerprint": info["fingerprint"],
+        "renew_soon": bool(
+            info["status"] == license_core.VALID
+            and info.get("days_remaining") is not None
+            and info["days_remaining"] <= info.get("warn_days", 7)),
+    }
+
+
+@app.get("/api/branding")
+def get_branding():
+    return branding_payload()
+
+
+@app.post("/api/branding")
+async def set_branding(
+        logo: UploadFile | None = File(None),
+        name: str | None = Body(None),
+        clear: bool | None = Body(False)):
+    """更新或清除自定义品牌。
+
+    - ``logo``：上传的图片文件（png/jpg/svg 等），保存为 ``data/branding/logo.<ext>``
+    - ``name``：产品名，保存为 ``data/branding/name.txt``
+    - ``clear=true``：删除已有的自定义 logo（name 可单独保留）
+    """
+    directory = branding_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    if clear:
+        for candidate in ("logo.svg", "logo.png", "logo.jpg", "logo.jpeg", "logo.ico"):
+            try:
+                (directory / candidate).unlink()
+            except FileNotFoundError:
+                pass
+    if name is not None:
+        name = str(name).strip()
+        if name:
+            (directory / "name.txt").write_text(name, encoding="utf-8")
+        else:
+            try:
+                (directory / "name.txt").unlink()
+            except FileNotFoundError:
+                pass
+    if logo is not None and logo.filename:
+        suffix = Path(logo.filename).suffix.lower() or ".png"
+        if suffix not in {".svg", ".png", ".jpg", ".jpeg", ".ico", ".webp", ".gif"}:
+            raise HTTPException(400, f"不支持的图片格式: {suffix}")
+        # 先删除其它格式的 logo，避免新旧格式并存
+        for candidate in ("logo.svg", "logo.png", "logo.jpg", "logo.jpeg",
+                          "logo.ico", "logo.webp", "logo.gif"):
+            try:
+                (directory / candidate).unlink()
+            except FileNotFoundError:
+                pass
+        data = await logo.read()
+        if len(data) > 5 * 1024 * 1024:
+            raise HTTPException(400, "Logo 图片不能超过 5MB")
+        (directory / f"logo{suffix}").write_bytes(data)
+    return branding_payload()
 
 
 def _xhs_browser_reads_enabled() -> bool:
@@ -770,6 +1049,8 @@ async def _enrich_account_profile(account_id: int, state: str, *,
             # 视频号扫码授权后，服务端会话偶尔要数秒才在新页面中生效。
             # 单次打开被重定向到登录页不能立即把刚添加的账号判为失效。
             u, err = await _fetch_channels_profile_with_retry(identity)
+        elif platform == "tiktok":
+            u, err = await fetch_tiktok_self_profile(browser, identity)
         else:
             mode = dy_transport["effective_mode"]
             u, err = None, ""
@@ -814,6 +1095,8 @@ async def _enrich_account_profile(account_id: int, state: str, *,
                 p = parse_ks_self_user(u)
             elif platform == "shipinhao":
                 p = parse_channels_self_user(u)
+            elif platform == "tiktok":
+                p = parse_tiktok_self_user(u)
             else:
                 p = parse_self_user(u)
             if p.get("nickname"):
@@ -829,6 +1112,11 @@ async def _enrich_account_profile(account_id: int, state: str, *,
                 acc.aweme_count = int(p.get("aweme_count") or 0)
                 acc.total_favorited = int(p.get("total_favorited") or 0)
                 acc.gender = str(p.get("gender") or "")
+            elif platform == "tiktok":
+                # TikTok videoCount/followerCount 同样可能合法为 0,显式落库。
+                acc.follower_count = int(p.get("follower_count") or 0)
+                acc.following_count = int(p.get("following_count") or 0)
+                acc.aweme_count = int(p.get("aweme_count") or 0)
             else:
                 acc.follower_count = p.get("follower_count") or acc.follower_count
                 acc.aweme_count = p.get("aweme_count") or acc.aweme_count
@@ -926,12 +1214,12 @@ async def _run_login(task_id: str, creator: bool = False, account_id: int | None
     fingerprint_fields = None
     is_fingerprint_environment = False
     login_environment = {}
-    nm = ("小红书账号" if platform == "xhs"
-          else "快手账号" if platform == "kuaishou"
-          else "视频号账号" if platform == "shipinhao"
+    nm = (f"{platforms.label_of(platform)}账号"
+          if platform in ("xhs", "kuaishou", "shipinhao", "tiktok")
           else "创作者账号" if creator else "扫码账号")
     try:
         # 1) 准备画像 + identity(新建账号此时不写库,只用临时 profile)
+        required_exit_country = ""
         if account_id:
             with get_session() as s:
                 acc = s.get(DouyinAccount, account_id)
@@ -943,6 +1231,7 @@ async def _run_login(task_id: str, creator: bool = False, account_id: int | None
                 ensure_identity(acc, cfg, session=s, assign_proxy=False)
                 s.add(acc); s.commit(); s.refresh(acc)
                 identity = browser.identity_for(acc)
+                required_exit_country = acc.required_exit_country or ""
                 acc_id = acc.id
         else:
             acc_id = None
@@ -1042,6 +1331,18 @@ async def _run_login(task_id: str, creator: bool = False, account_id: int | None
                 yield guarded
 
         async with _login_guard():
+            # 平台级网络前置闸门(当前仅 TikTok):无代理/出口地区不符/探测失败
+            # 一律在打开浏览器前阻断,返回可执行原因。手动登录强制刷新探测。
+            gate_ready = await platforms.run_network_gate(
+                platform, cfg=cfg, proxy=identity.proxy,
+                required_country=required_exit_country,
+                account_id=identity.account_id, force_refresh=True)
+            if gate_ready is not None and not gate_ready.get("ok"):
+                login_tasks[task_id] = _login_task_state(
+                    status="error", platform=platform, creator=creator,
+                    account_id=account_id,
+                    error=gate_ready.get("reason") or "网络出口校验未通过")
+                return
             if platform == "xhs":
                 reauth_options = {"force_reauth": True} if account_id else {}
                 if creator:
@@ -1080,6 +1381,10 @@ async def _run_login(task_id: str, creator: bool = False, account_id: int | None
                 reauth_options = {"force_reauth": True} if account_id else {}
                 ok, state_json, nickname = await interactive_channels_login(
                     browser, identity, **reauth_options)
+            elif platform == "tiktok":
+                reauth_options = {"force_reauth": True} if account_id else {}
+                ok, state_json, nickname = await interactive_tiktok_login(
+                    browser, identity, **reauth_options)
             elif creator:
                 reauth_options = {"force_reauth": True} if account_id else {}
                 ok, state_json, nickname = await interactive_creator_login(
@@ -1096,12 +1401,19 @@ async def _run_login(task_id: str, creator: bool = False, account_id: int | None
         # 3) 仅在成功时落库
         if ok and state_json:
             is_xhs = platform == "xhs"
+            is_tiktok = platform == "tiktok"
             observed_profile = {}
             if is_xhs and not creator:
                 raw_observed = getattr(
                     identity, "observed_login_profile", {}) or {}
                 if isinstance(raw_observed, dict):
                     observed_profile = parse_xhs_self_user(raw_observed)
+            elif is_tiktok:
+                # TikTok 登录函数已把归一化资料挂在 identity 上
+                raw_observed = getattr(
+                    identity, "observed_login_profile", {}) or {}
+                if isinstance(raw_observed, dict):
+                    observed_profile = raw_observed
             with get_session() as s:
                 if account_id:
                     acc = s.get(DouyinAccount, acc_id)
@@ -1169,8 +1481,8 @@ async def _run_login(task_id: str, creator: bool = False, account_id: int | None
                     # 一次主站扫码同时可读取和发布，不再要求用户重复扫“创作者登录”。
                     acc.storage_state = state_json
                     acc.creator_storage_state = state_json
-                elif platform == "shipinhao":
-                    # 视频号一套登录态即读取又发布,两处都写
+                elif platform == "shipinhao" or is_tiktok:
+                    # 视频号/TikTok 一套登录态既读取又发布,两处都写
                     acc.storage_state = state_json
                     acc.creator_storage_state = state_json
                 else:
@@ -1496,6 +1808,34 @@ async def login_channels_start(proxy: str = "auto", browser_backend: str = "defa
             "hint": "已打开视频号助手窗口,请用微信扫码登录"}
 
 
+@app.post("/api/login/tiktok/start")
+async def login_tiktok_start(proxy: str = "auto", browser_backend: str = "default",
+                             browser_runtime_id: str = "",
+                             fingerprint: dict[str, Any] | None = None):
+    """TikTok 国际版网页登录。网络闸门强制要求海外代理,无代理不会打开窗口。"""
+    if browser is None:
+        raise HTTPException(503, "浏览器未就绪")
+    browser_backend, browser_runtime_id = _validate_login_browser_backend(
+        browser_backend, browser_runtime_id)
+    fingerprint_overrides = _validate_prelogin_fingerprint(
+        fingerprint, browser_backend, browser_runtime_id)
+    reused = await _reuse_or_reject_interactive_login("tiktok", False)
+    if reused is not None:
+        return reused
+    task_id = uuid.uuid4().hex
+    login_tasks[task_id] = _login_task_state(
+        status="opening", platform="tiktok", creator=False,
+        account_id=None)
+    asyncio.create_task(_run_login(
+        task_id, platform="tiktok", proxy_choice=proxy,
+        browser_backend=browser_backend,
+        browser_runtime_id=browser_runtime_id,
+        fingerprint_overrides=fingerprint_overrides))
+    return {"task_id": task_id, "status": "opening",
+            "hint": "正在打开 TikTok 登录页,请在窗口中扫码或用账号密码登录；"
+                    "需先绑定可用的海外代理"}
+
+
 @app.get("/api/login/browser/poll")
 async def login_browser_poll(task_id: str):
     info = login_tasks.get(task_id)
@@ -1516,7 +1856,7 @@ class CookieIn(BaseModel):
 @app.post("/api/login/cookie")
 async def login_cookie(body: CookieIn):
     """Cookie 粘贴兜底登录:转成浏览器登录态。"""
-    platform = body.platform if body.platform in ("douyin", "xhs", "kuaishou") else "douyin"
+    platform = body.platform if body.platform in platforms.cookie_login_platforms() else "douyin"
     state = cookie_string_to_state(body.cookie, platform)
     with get_session() as s:
         acc = DouyinAccount(
@@ -1531,7 +1871,7 @@ async def login_cookie(body: CookieIn):
 
 @app.get("/api/overview/summary")
 async def overview_summary(platform: str = "douyin"):
-    if platform not in {"douyin", "xhs", "kuaishou", "shipinhao"}:
+    if platform not in {s.key for s in platforms.all_specs()}:
         raise HTTPException(422, "平台类型无效")
     with get_session() as session:
         def count(model, *conditions):
@@ -1587,7 +1927,7 @@ async def list_accounts(platform: str | None = None):
                     environment_check = None
             has_creator = (
                 bool(a.creator_storage_state)
-                or (a.platform in ("kuaishou", "douyin", "shipinhao")
+                or (a.platform in ("kuaishou", "douyin", "shipinhao", "tiktok")
                     and bool(a.storage_state))
                 or (a.platform == "xhs" and has_creator_cookies(a.storage_state))
             )
@@ -2110,16 +2450,10 @@ def _account_risk_view(account: DouyinAccount, now: datetime, *,
 
     if account.douyin_id:
         platform_account_id = account.douyin_id
-        platform_account_id_label = {
-            "douyin": "抖音号", "xhs": "小红书号",
-            "kuaishou": "快手号", "shipinhao": "视频号",
-        }.get(account.platform, "账号 ID")
+        platform_account_id_label = platforms.account_id_label(account.platform)
     else:
         platform_account_id = account.sec_uid
-        platform_account_id_label = {
-            "douyin": "sec_uid", "xhs": "user_id",
-            "kuaishou": "user_id", "shipinhao": "finder_id",
-        }.get(account.platform, "账号 ID")
+        platform_account_id_label = platforms.sec_uid_label(account.platform)
     return {
         "account_id": account.id,
         "platform_account_id": platform_account_id,
@@ -3195,6 +3529,7 @@ async def refresh_account_profile(account_id: int):
     if res != "ok":
         tag = ("[xhs_self_profile]" if platform == "xhs"
                else "[ks_self_profile]" if platform == "kuaishou"
+               else "[tiktok_self_profile]" if platform == "tiktok"
                else "[self_profile]")
         raise HTTPException(400, f"未能获取账号资料:请看服务端控制台 {tag} 那行日志"
                                  "(含它实际看到的请求),把它发我即可定位")
@@ -3207,7 +3542,7 @@ async def refresh_account_profile(account_id: int):
         )
         has_creator_login = bool(acc and (
             acc.creator_storage_state
-            or (acc.platform in ("kuaishou", "douyin", "shipinhao")
+            or (acc.platform in ("kuaishou", "douyin", "shipinhao", "tiktok")
                 and acc.storage_state)
             or (acc.platform == "xhs" and has_creator_cookies(acc.storage_state))
         ))
@@ -3306,6 +3641,9 @@ async def sync_account_works(account_id: int):
             raise HTTPException(400, "账号代理不可用")
         platform = acc.platform
         uid = acc.sec_uid or ""
+        if platform == "tiktok":
+            # TikTok 主页路由用 uniqueId(登录资料归一化时落在 douyin_id 列)
+            uid = acc.douyin_id or uid
         transport = (resolve_transport(cfg, "douyin", "account_works", acc)
                      if platform == "douyin" else None)
         effective_mode = transport["effective_mode"] if transport else "browser"
@@ -3344,6 +3682,10 @@ async def sync_account_works(account_id: int):
                 "configured_mode": (transport["configured_mode"]
                                     if transport else "browser")}
     if not items:
+        if err == "empty":
+            # TikTok 明确返回有效空列表(新账号 0 作品):同步成功,不碰旧数据
+            return {"ok": True, "fetched": 0, "added": 0,
+                    "source": source or "browser"}
         if err and err.startswith("missing_uid"):
             raise HTTPException(400, err.split(":", 1)[-1])
         raise HTTPException(400, f"未抓到作品:{err or '可能登录态失效/无公开作品'}"
@@ -3429,7 +3771,7 @@ async def sync_work_comments(work_id: int):
             raise HTTPException(404, "作品不存在")
         platform, item_id = w.platform, w.item_id
         account_id, xsec_token = w.account_id, w.xsec_token
-    res = await engine.sync_work_comments(account_id, platform, item_id, xsec_token)
+    res = await engine.sync_work_comments(account_id, platform, item_id, xsec_token, manual=True)
     if not res.get("ok") and not res.get("added"):
         raise HTTPException(400, f"抓评论失败:{res.get('error') or '未知'}"
                                  "(详情见服务端控制台日志)")
@@ -3579,7 +3921,10 @@ async def _sync_follows_impl(account_id: int, direction: str = "following",
         if not acc:
             raise HTTPException(404, "账号不存在")
         platform = acc.platform
+        _require_capability(platform, platforms.FOLLOW_SYNC)
         uid = acc.sec_uid or ""
+        if platform == "tiktok":
+            uid = acc.douyin_id or uid
         operation = "following_list" if direction == "following" else "followers_list"
         transport = (resolve_transport(cfg, "douyin", operation, acc)
                      if platform == "douyin" else None)
@@ -3740,6 +4085,7 @@ async def start_follow_sync_job(account_id: int,
         account = s.get(DouyinAccount, account_id)
         if not account:
             raise HTTPException(404, "账号不存在")
+        _require_capability(account.platform, platforms.FOLLOW_SYNC)
         expected_total = (account.following_count if direction == "following"
                           else account.follower_count)
     for existing in reversed(list(_follow_sync_jobs.values())):
@@ -3854,6 +4200,7 @@ async def sync_dm(account_id: int):
         if not acc:
             raise HTTPException(404, "账号不存在")
         platform = acc.platform
+        _require_capability(platform, platforms.DM)
         dm_transport = (resolve_transport(cfg, "douyin", "dm_sync", acc)
                         if platform == "douyin" else None)
         if dm_transport and dm_transport["effective_mode"] == "unavailable":
@@ -3890,6 +4237,94 @@ async def sync_dm(account_id: int):
             "cached": bool(result.get("skipped") and cached_conversations),
             "reason": result.get("reason") or "",
         }
+    if platform == "tiktok":
+        if browser is None or identity is None:
+            raise HTTPException(503, "浏览器未就绪")
+        conversations, err = await fetch_tiktok_dm_conversations(
+            browser, identity)
+        if err.startswith("logged_out"):
+            raise HTTPException(400, "登录态已失效,请点「重新登录」")
+        if err:
+            raise HTTPException(400, err)
+        now = datetime.utcnow()
+        with get_session() as s:
+            for old in s.exec(select(DmConversation).where(
+                    DmConversation.account_id == account_id)).all():
+                s.delete(old)
+            for old in s.exec(select(DmMessage).where(
+                    DmMessage.account_id == account_id,
+                    DmMessage.msg_id.like("last:%"))).all():
+                s.delete(old)
+            msgs = 0
+            for c in conversations:
+                s.add(DmConversation(platform=platform, account_id=account_id,
+                                     fetched_at=now, **c))
+                meta = {}
+                try:
+                    meta = json.loads(c.get("raw_json") or "{}")
+                except Exception:
+                    meta = {}
+                if c.get("last_text"):
+                    direction = ("out" if meta.get("last_sender_uid")
+                                 and meta.get("last_sender_uid") == meta.get("self_uid")
+                                 else "in")
+                    s.add(DmMessage(
+                        platform=platform, account_id=account_id,
+                        conv_id=c["conv_id"],
+                        msg_id="last:" + c["conv_id"], direction=direction,
+                        msg_type="text", text=c["last_text"],
+                        create_time=c.get("last_time") or 0))
+                    msgs += 1
+            self_uid = ""
+            for c in conversations:
+                try:
+                    self_uid = (json.loads(c.get("raw_json") or "{}")).get("self_uid", "")
+                except Exception:
+                    self_uid = ""
+                if self_uid:
+                    break
+            if self_uid:
+                acc2 = s.get(DouyinAccount, account_id)
+                if acc2 and acc2.uid != self_uid:
+                    acc2.uid = self_uid
+                    s.add(acc2)
+            s.commit()
+        # 客服统一入站总线：对方发来的最新一条私信自动建档/镜像（幂等：
+        # 同一 last_time 快照重复同步只入库一次）；游标按最新消息时间持久化
+        try:
+            from .cs import inbound as cs_inbound
+            rows = []
+            for c in conversations:
+                if not c.get("last_text"):
+                    continue
+                try:
+                    meta = json.loads(c.get("raw_json") or "{}")
+                except Exception:
+                    meta = {}
+                last_sender = str(meta.get("last_sender_uid") or "")
+                if last_sender and last_sender == str(meta.get("self_uid") or ""):
+                    continue                      # 自己发出的，不入客户消息
+                last_ts = int(c.get("last_time") or 0)
+                rows.append({
+                    "thread_key": c["conv_id"],
+                    "text": c["last_text"],
+                    "platform_msg_id": f"last:{c['conv_id']}:{last_ts}",
+                    "peer_uid": str(c.get("peer_uid") or ""),
+                    "peer_nickname": str(c.get("peer_nickname") or ""),
+                    "peer_avatar": str(c.get("peer_avatar") or ""),
+                    "msg_ts": last_ts,
+                })
+            if rows:
+                latest = max(r["msg_ts"] for r in rows)
+                cs_inbound.ingest_dm_batch(
+                    platform="tiktok", account_id=account_id,
+                    account_key=(acc.sec_uid or acc.uid or ""),
+                    rows=rows, cursor=str(latest))
+        except Exception as _cs_exc:
+            print(f"[tiktok-dm] 客服联动失败（不影响私信同步）: {_cs_exc!r}")
+        return {"ok": True, "fetched": len(conversations),
+                "added": len(conversations), "messages": msgs,
+                "source": "browser"}
     source = "api" if effective_mode == "api" else "browser"
 
     async def _fetch_conversations():
@@ -4338,7 +4773,10 @@ async def _exec_action(task_id: int) -> tuple[bool, str]:
     """立即执行一条写操作:委托引擎(带每账号串行锁,避免同号并发开窗)。"""
     if engine is None:
         raise HTTPException(503, "引擎未就绪")
-    res = await engine.execute_action_task(task_id)
+    try:
+        res = await engine.execute_action_task(task_id, manual=True)
+    except AccountBusyError as exc:
+        return False, str(exc)
     return bool(res.get("ok")), (res.get("error") or "")
 
 
@@ -4393,6 +4831,21 @@ async def create_account_action(body: ActionIn, request: Request = None):
 
 @app.post("/api/account-actions/{task_id}/run-now")
 async def run_account_action(task_id: int):
+    # 人工显式发送:清账号级写暂停和人工验证标记(同评论任务 run-now)
+    with get_session() as s:
+        t = s.get(AccountActionTask, task_id)
+        if t and t.account_id:
+            acc = s.get(DouyinAccount, t.account_id)
+            if acc and acc.write_paused_until:
+                acc.write_paused_until = None
+                acc.write_pause_reason = ""
+                s.add(acc)
+            rstate = s.get(AccountRiskState, t.account_id)
+            if rstate and rstate.manual_review_required:
+                rstate.manual_review_required = False
+                rstate.manual_review_reason = ""
+                s.add(rstate)
+            s.commit()
     ok, detail = await _exec_action(task_id)
     if not ok:
         raise HTTPException(400, f"执行失败:{detail}")
@@ -5797,7 +6250,7 @@ async def _douyin_native_share(
     proxy: str,
     user_agent: str,
 ) -> dict | None:
-    """用 CreatorHub 自带抖音接口兜底 yt-dlp 尚未支持的 /note/、/slides/。
+    """用 mmm 自带抖音接口兜底 yt-dlp 尚未支持的 /note/、/slides/。
 
     返回 None 表示它不是可解析的抖音单作品链接，应继续走通用提取器。
     """
@@ -6073,6 +6526,168 @@ async def _xhs_native_share(
     }
 
 
+async def _tiktok_native_share(
+    source_url: str,
+    *,
+    account_id: int | None,
+    output_root: Path,
+    quality: str,
+    should_download: bool,
+    save_metadata: bool,
+    save_thumbnail: bool,
+    proxy: str,
+) -> dict | None:
+    """用已登录 TikTok 账号的浏览器读取作品,再由通用 Downloader 落盘。
+
+    视频与图集都走页面注水数据(不做私有 API 逆向)。未选择账号时:
+    长链/移动页视频返回 None,继续由 yt-dlp 通用提取器处理;图集链接
+    无法匿名读取,直接给出可执行提示。短链在浏览器导航中完成跳转。
+    """
+    parsed_ref = parse_tiktok_item_url(source_url)
+    if account_id is None:
+        if parsed_ref and parsed_ref[0] == "photo":
+            raise ShareDownloadError(
+                "TikTok 图集链接需要选择一个已登录的 TikTok 账号后下载；"
+                "视频链接也建议复用账号登录态以减少地区限制"
+            )
+        return None
+
+    with get_session() as session:
+        account = session.get(DouyinAccount, account_id)
+        if not account or account.platform != "tiktok":
+            return None
+        identity = browser.identity_for(account)
+
+    from .browser.manager import normalize_proxy
+    if normalize_proxy(proxy) != normalize_proxy(identity.proxy):
+        raise ShareDownloadError(
+            "TikTok 链接下载必须复用账号已绑定代理；请先在账号环境中配置代理，"
+            "不要在下载页临时切换出口"
+        )
+
+    # 原生直链不做音频转码;仅音频请求继续交给 yt-dlp/ffmpeg。
+    if quality == "audio":
+        return None
+
+    async def _read_item():
+        item, final_url, read_error = await fetch_tiktok_share_item(
+            browser,
+            identity,
+            source_url,
+            timeout_ms=max(
+                15000, int(cfg.engine.request_timeout_seconds * 1000)),
+            block_media=cfg.engine.block_media_resources,
+        )
+        return {"item": item, "final_url": final_url}, read_error
+
+    payload, outcome = await _run_account_read(
+        account_id,
+        OperationKind.READ_HEAVY,
+        f"share-tiktok:{account_id}",
+        _read_item,
+        empty_result={"item": {}, "final_url": source_url},
+    )
+    if isinstance(outcome, dict):
+        raise ShareDownloadError(
+            f"TikTok 账号读取正在冷却: {outcome.get('reason') or '稍后重试'}")
+    if outcome:
+        reason = str(outcome)
+        if reason == "login_required":
+            raise ShareDownloadError(
+                "TikTok 账号登录态已失效，请重新登录后再下载")
+        if reason == "timeout":
+            raise ShareDownloadError(
+                "TikTok 作品页面已打开但未取得作品数据，可能遇到人机校验；"
+                "请稍后重试或更换代理出口")
+        if reason.startswith("goto:") or reason.startswith("open_page:"):
+            raise ShareDownloadError(
+                f"TikTok 作品页面打开失败（{reason}），请检查代理出口后重试")
+        raise ShareDownloadError(f"TikTok 作品读取失败: {reason}")
+
+    raw = payload.get("item") or {}
+    final_url = str(payload.get("final_url") or source_url)
+    aweme = parse_tiktok_item(raw, quality)
+    if not aweme:
+        raise ShareDownloadError(
+            "TikTok 作品页已打开，但没有取得可下载的视频或图集")
+
+    metadata = _native_aweme_metadata(aweme, final_url)
+    if not should_download:
+        return {
+            "ok": True,
+            "url": source_url,
+            "metadata": metadata,
+            "warnings": [],
+        }
+
+    actual_ua = _direct_request_ua(identity)
+    downloader = Downloader(
+        str(output_root), actual_ua,
+        timeout=max(30.0, cfg.engine.download_timeout_seconds),
+    )
+    ok, _local_path, error = await downloader.download_aweme(
+        aweme, base_dir=str(output_root), proxy=identity.proxy or ""
+    )
+    if not ok:
+        raise ShareDownloadError(error or "TikTok 媒体下载失败")
+
+    target_dir = output_root / safe_title(aweme.author_name or "unknown")
+    title = safe_title(aweme.desc) or aweme.aweme_id
+    if save_metadata:
+        info_path = target_dir / f"{aweme.aweme_id}_{title}.info.json"
+        info_path.write_text(
+            json.dumps({
+                **metadata,
+                "media": [
+                    {"url": media.url, "kind": media.kind,
+                     "ext": media.ext, "index": media.index}
+                    for media in aweme.medias
+                ],
+                "raw": raw,
+            }, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    if save_thumbnail and aweme.media_type == "video" and aweme.cover:
+        cover_path = target_dir / f"{aweme.aweme_id}_{title}.cover.jpg"
+        try:
+            async with httpx.AsyncClient(
+                    timeout=max(30.0, cfg.engine.download_timeout_seconds),
+                    follow_redirects=True,
+                    headers={
+                        "User-Agent": actual_ua,
+                        "Referer": "https://www.tiktok.com/",
+                    },
+                    proxy=normalize_proxy(identity.proxy) or None) as http:
+                await downloader._download_one(http, aweme.cover, cover_path)
+        except Exception:
+            pass
+
+    files = []
+    for path in sorted(target_dir.glob(f"{aweme.aweme_id}_*")):
+        if not path.is_file() or path.suffix.lower() in {".part", ".ytdl"}:
+            continue
+        files.append({
+            "name": path.name,
+            "path": str(path.resolve()),
+            "relative_path": path.relative_to(output_root).as_posix(),
+            "size": path.stat().st_size,
+            "role": _share_file_role(path),
+        })
+    if not any(item["role"] == "media" for item in files):
+        raise ShareDownloadError("TikTok 作品解析成功，但本地没有生成媒体文件")
+    return {
+        "ok": True,
+        "job_id": f"tiktok_{aweme.aweme_id}",
+        "url": source_url,
+        "output_dir": str(target_dir.resolve()),
+        "metadata": metadata,
+        "files": files,
+        "progress": {"status": "finished"},
+        "warnings": [],
+    }
+
+
 @app.post("/api/share-download/links")
 async def parse_share_links(body: ShareLinksIn):
     """只做本地文本清洗和链接提取，不访问分享站点。"""
@@ -6144,6 +6759,17 @@ async def share_download(body: ShareDownloadIn):
                         )
                     elif link.platform == "xhs":
                         item = await _xhs_native_share(
+                            link.url,
+                            account_id=body.account_id,
+                            output_root=output_root,
+                            quality=body.quality,
+                            should_download=body.download,
+                            save_metadata=body.save_metadata,
+                            save_thumbnail=body.save_thumbnail,
+                            proxy=proxy,
+                        )
+                    elif link.platform == "tiktok":
+                        item = await _tiktok_native_share(
                             link.url,
                             account_id=body.account_id,
                             output_root=output_root,
@@ -6282,7 +6908,7 @@ def _share_history_local_path(
 
 
 def _require_local_action(request: Request, action: str = "reveal") -> None:
-    """仅允许本机 CreatorHub 页面触发文件管理器操作。"""
+    """仅允许本机 mmm 页面触发文件管理器操作。"""
     def is_loopback(host: str) -> bool:
         host = host.split("%", 1)[0].casefold()
         if host == "localhost":
@@ -6304,7 +6930,7 @@ def _require_local_action(request: Request, action: str = "reveal") -> None:
     local_action = request.headers.get("x-creatorhub-local-action") == action
     if not is_loopback(client_host) or not is_loopback(page_host) or \
             not same_origin or not local_action:
-        raise HTTPException(403, "仅允许从本机 CreatorHub 页面执行文件操作")
+        raise HTTPException(403, "仅允许从本机 mmm 页面执行文件操作")
 
 
 @app.get("/api/share-download/history/{record_id}/media/{media_index}")
@@ -6465,8 +7091,12 @@ def _validated_collection_input(body: KeywordCollectionIn) \
         -> tuple[str, list[str], str, str, dict]:
     """校验创建/编辑共用的任务配置并返回规范化值。"""
     platform = body.platform.strip().lower()
-    if platform != "douyin":
-        raise HTTPException(400, "当前版本关键词批量采集仅支持抖音")
+    blocked = platforms.blocked_capability_reason(platform,
+                                                  platforms.KEYWORD_COLLECTION)
+    if blocked:
+        raise HTTPException(400, blocked)
+    if platform not in {"douyin", "tiktok"}:
+        raise HTTPException(400, "当前版本关键词批量采集仅支持抖音与 TikTok")
     keywords = _collection_keywords(body.keywords)
     if not keywords:
         raise HTTPException(400, "请至少填写一个关键词")
@@ -6723,8 +7353,8 @@ async def update_keyword_collection(job_id: int, body: KeywordCollectionIn):
         job = session.get(KeywordCollectionJob, job_id)
         if not job:
             raise HTTPException(404, "采集任务不存在")
-        if job.platform != "douyin":
-            raise HTTPException(400, "当前版本仅支持编辑抖音采集任务")
+        if job.platform not in {"douyin", "tiktok"}:
+            raise HTTPException(400, "当前版本仅支持编辑抖音/TikTok 采集任务")
         if job.status in {"pending", "running"}:
             raise HTTPException(409, "等待或执行中的任务请先取消，再编辑配置")
         account = session.get(DouyinAccount, body.account_id)
@@ -6754,7 +7384,7 @@ async def list_keyword_collections(platform: str | None = None, limit: int = 100
     limit = max(1, min(limit, 300))
     with get_session() as session:
         stmt = select(KeywordCollectionJob)
-        if platform in {"douyin", "xhs"}:
+        if platform in {"douyin", "xhs", "tiktok"}:
             stmt = stmt.where(KeywordCollectionJob.platform == platform)
         rows = session.exec(
             stmt.order_by(KeywordCollectionJob.created_at.desc()).limit(limit)).all()
@@ -7052,20 +7682,24 @@ def _validate_monitor_strategy(*, max_scrolls: int | None,
         raise HTTPException(400, "发布时间范围须为 0~3650 天；0 表示不限")
 
 
+def _require_capability(platform: str, capability: str) -> None:
+    """接口层能力闸门:已知平台不具备该能力(如视频号的对外监控/私信)时,
+    直接 400 并返回明确原因,杜绝静默降级到默认平台后空转或假成功。
+    原因文案以 platforms.registry 的 Spike 结论表为准。"""
+    reason = platforms.blocked_capability_reason(platform, capability)
+    if reason:
+        raise HTTPException(400, reason)
+
+
 def _clean_platform_target_input(value: str, platform: str) -> str:
     """复用分享链接下载的清洗器，返回当前平台的第一条有效链接或原始 ID。"""
     target_input, detected_links = clean_platform_share_target(value, platform)
     if detected_links and not any(
             item.platform == platform for item in detected_links):
-        platform_name = {
-            "douyin": "抖音", "xhs": "小红书", "kuaishou": "快手",
-        }.get(platform, platform)
-        detected_names = {
-            "douyin": "抖音", "xhs": "小红书", "kuaishou": "快手",
-            "generic": "其他站点",
-        }
+        platform_name = platforms.label_of(platform, platform)
         names = "、".join(dict.fromkeys(
-            detected_names.get(item.platform, item.platform)
+            "其他站点" if item.platform == "generic"
+            else platforms.label_of(item.platform)
             for item in detected_links
         ))
         raise HTTPException(
@@ -7097,7 +7731,8 @@ def _ensure_creator_monitor_available(session, *, platform: str, sec_uid: str,
 
 @app.post("/api/monitors")
 async def add_monitor(body: TargetIn):
-    platform = body.platform if body.platform in ("douyin", "xhs", "kuaishou") else "douyin"
+    _require_capability(body.platform, platforms.WORK_MONITOR)
+    platform = body.platform if body.platform in platforms.keys_with(platforms.WORK_MONITOR) else "douyin"
     sec_uid = keyword = xsec_token = ""
     kind = "creator"
 
@@ -7118,6 +7753,13 @@ async def add_monitor(body: TargetIn):
         sec_uid = await resolve_ks_user_id(target_input, cfg.engine.user_agent)
         if not sec_uid:
             raise HTTPException(400, "无法解析快手 user_id,请粘贴完整分享文案、创作者主页链接 / v.kuaishou.com 短链 / user_id")
+    elif platform == "tiktok":
+        sec_uid = parse_tiktok_handle(target_input)
+        if not sec_uid:
+            raise HTTPException(
+                400,
+                "无法识别 TikTok 创作者主页,请粘贴 https://www.tiktok.com/@用户名 "
+                "形式的主页链接或直接填写 TikTok 号(不支持作品链接与短链)")
     elif platform == "douyin":
         sec_uid = await resolve_sec_uid(target_input, cfg.engine.user_agent)
         if not sec_uid:
@@ -7149,6 +7791,14 @@ async def add_monitor(body: TargetIn):
             if (not monitor_acc or monitor_acc.platform != "douyin"
                     or monitor_acc.status != "active"):
                 raise HTTPException(400, "所选抖音账号不存在或登录态已失效")
+        elif platform == "tiktok":
+            if not body.account_id:
+                raise HTTPException(
+                    400, "TikTok 作品监控必须选择已通过网络体检的登录账号(禁止本机直连海外)")
+            monitor_acc = s.get(DouyinAccount, body.account_id)
+            if (not monitor_acc or monitor_acc.platform != "tiktok"
+                    or monitor_acc.status != "active"):
+                raise HTTPException(400, "所选 TikTok 账号不存在或登录态已失效")
         elif body.account_id:
             monitor_acc = s.get(DouyinAccount, body.account_id)
             if not monitor_acc or monitor_acc.platform != platform:
@@ -8356,7 +9006,8 @@ async def list_watches(platform: str | None = None):
 
 @app.post("/api/comment-watches")
 async def add_watch(body: WatchIn):
-    platform = body.platform if body.platform in ("douyin", "xhs", "kuaishou") else "douyin"
+    _require_capability(body.platform, platforms.COMMENT_MONITOR)
+    platform = body.platform if body.platform in platforms.keys_with(platforms.COMMENT_MONITOR) else "douyin"
     aweme_id = sec_uid = xsec_token = ""
     title = ""
     target_input = _clean_platform_target_input(body.url_or_id, platform)
@@ -8369,6 +9020,15 @@ async def add_watch(body: WatchIn):
         raise HTTPException(400, "近期天数须为 0~365，0 表示跟随全局设置")
     if not 0 <= body.max_scrolls <= 50:
         raise HTTPException(400, "抓取深度须为 0~50，0 表示跟随全局设置")
+    # 评论监控必须绑定已登录账号:匿名抓取易被平台风控拦截,且未绑账号的评论
+    # 转人工后无法自动回投客服回复。
+    if not body.account_id:
+        raise HTTPException(400, "评论监控必须选择一个已登录账号")
+    with get_session() as _s:
+        _watch_acc = _s.get(DouyinAccount, body.account_id)
+        if (not _watch_acc or _watch_acc.platform != platform
+                or _watch_acc.status == "invalid"):
+            raise HTTPException(400, "所选账号不可用，请选择同平台的有效登录账号")
     if platform == "xhs":
         kind = body.kind
         if kind == "auto":
@@ -8409,6 +9069,34 @@ async def add_watch(body: WatchIn):
             sec_uid = await resolve_ks_user_id(target_input, cfg.engine.user_agent)
             if not sec_uid:
                 raise HTTPException(400, "无法解析快手 user_id,请粘贴完整分享文案、主页链接 / 短链 / user_id")
+        mode = "public"
+    elif platform == "tiktok":
+        kind = body.kind
+        if kind == "auto":
+            ref = parse_tiktok_item_url(target_input)
+            if ref and ref[0] == "video":
+                aweme_id = ref[1]
+                kind = "video"
+            else:
+                sec_uid = parse_tiktok_handle(target_input)
+                kind = "user" if sec_uid else "video"
+        if kind == "video":
+            if not aweme_id:
+                ref = parse_tiktok_item_url(target_input)
+                if ref and ref[0] == "video":
+                    aweme_id = ref[1]
+            if not aweme_id:
+                # 兼容纯数字 id 直接粘贴
+                candidate = target_input.strip()
+                if candidate.isdigit():
+                    aweme_id = candidate
+            if not aweme_id:
+                raise HTTPException(400, "无法解析 TikTok 视频 id,请粘贴完整分享文案、作品链接 / 数字 id")
+            title = "视频 " + aweme_id
+        else:
+            sec_uid = parse_tiktok_handle(target_input)
+            if not sec_uid:
+                raise HTTPException(400, "无法解析 TikTok 主页,请粘贴主页链接 / @handle / 裸号")
         mode = "public"
     else:
         kind = body.kind
@@ -8526,7 +9214,7 @@ async def del_watch(wid: int, with_comments: bool = False):
 async def scan_watch_now(wid: int):
     if not engine:
         raise HTTPException(503, "引擎未就绪")
-    return await engine.scan_comment_watch(wid)
+    return await engine.scan_comment_watch(wid, manual=True)
 
 
 # ─────────── 评论 / 弹幕记录来源 ───────────
@@ -9063,7 +9751,7 @@ async def delete_danmaku_watch(wid: int, with_records: bool = False):
 async def scan_danmaku_watch_now(wid: int):
     if engine is None:
         raise HTTPException(503, "引擎未就绪")
-    result = await engine.scan_danmaku_watch(wid)
+    result = await engine.scan_danmaku_watch(wid, manual=True)
     if not result.get("ok") and not result.get("new_danmaku"):
         raise HTTPException(400, result.get("error") or "弹幕抓取失败")
     return result
@@ -9274,8 +9962,9 @@ async def add_publish(body: PublishIn, request: Request = None):
             if body.media_type not in ("images", "video"):
                 raise HTTPException(400, "media_type 须为 images 或 video")
             acc = s.get(DouyinAccount, body.account_id)
-            if not acc or acc.platform not in ("xhs", "kuaishou", "douyin", "shipinhao"):
-                raise HTTPException(400, "请选择一个已登录的抖音 / 小红书 / 快手 / 视频号账号")
+            if not acc or acc.platform not in ("xhs", "kuaishou", "douyin",
+                                               "shipinhao", "tiktok"):
+                raise HTTPException(400, "请选择一个已登录的抖音 / 小红书 / 快手 / 视频号 / TikTok 账号")
             if acc.platform == "xhs":
                 from .platforms.xhs.media import validate_publish_files
                 try:
@@ -9286,9 +9975,8 @@ async def add_publish(body: PublishIn, request: Request = None):
                 paths = [p for p in body.media_paths if Path(p).is_file()]
                 if not paths:
                     raise HTTPException(400, "没有可用的媒体文件,请先上传")
-            pname = {"kuaishou": "快手", "douyin": "抖音",
-                     "shipinhao": "视频号"}.get(acc.platform, "小红书")
-            if acc.platform in ("kuaishou", "douyin", "shipinhao"):
+            pname = platforms.label_of(acc.platform, "小红书")
+            if acc.platform in ("kuaishou", "douyin", "shipinhao", "tiktok"):
                 if not (acc.creator_storage_state or acc.storage_state):
                     raise HTTPException(400, f"该{pname}账号不可发布:请先在账号页完成登录")
             elif not (acc.creator_storage_state or has_creator_cookies(acc.storage_state)):
@@ -9352,7 +10040,10 @@ async def update_publish(tid: int, body: PublishUpdate):
 async def run_publish(tid: int):
     if not engine:
         raise HTTPException(503, "引擎未就绪")
-    return await engine.publish_task(tid)
+    try:
+        return await engine.publish_task(tid, manual=True)
+    except AccountBusyError as exc:
+        return {"ok": False, "error": str(exc), "busy": True}
 
 
 @app.delete("/api/publish/{tid}")
@@ -9866,8 +10557,8 @@ async def _resolve_rule_target(platform: str, mode: str, target_kind: str, targe
             keyword = (target or "").strip()
             if not keyword:
                 raise HTTPException(400, "请填写要评论的搜索关键词")
-            if platform in ("douyin", "kuaishou"):
-                pn = "快手" if platform == "kuaishou" else "抖音"
+            if platform in ("douyin", "kuaishou", "tiktok"):
+                pn = {"douyin": "抖音", "kuaishou": "快手"}.get(platform, "TikTok")
                 raise HTTPException(400, f"{pn}暂不支持关键词发现,请用「创作者」模式")
         else:
             if platform == "xhs":
@@ -9879,6 +10570,13 @@ async def _resolve_rule_target(platform: str, mode: str, target_kind: str, targe
                 sec_uid = await resolve_ks_user_id(target, cfg.engine.user_agent)
                 if not sec_uid:
                     raise HTTPException(400, "无法解析快手创作者(主页链接 / 短链 / user_id)")
+            elif platform == "tiktok":
+                sec_uid = parse_tiktok_handle(target)
+                if not sec_uid:
+                    raise HTTPException(
+                        400, "无法识别 TikTok 创作者主页,请粘贴 "
+                        "https://www.tiktok.com/@用户名 形式的主页链接或直接填写 "
+                        "TikTok 号(不支持作品链接与短链)")
             else:
                 sec_uid = await resolve_sec_uid(target, cfg.engine.user_agent)
                 if not sec_uid:
@@ -9895,6 +10593,19 @@ async def _resolve_rule_target(platform: str, mode: str, target_kind: str, targe
                 aweme_id = await resolve_ks_photo_id(target, cfg.engine.user_agent)
                 if not aweme_id:
                     raise HTTPException(400, "无法解析快手作品 id(作品链接 / 短链 / photo_id)")
+            elif platform == "tiktok":
+                ref = parse_tiktok_item_url(target)
+                if ref and ref[0] == "video":
+                    aweme_id = ref[1]
+                else:
+                    candidate = (target or "").strip()
+                    if candidate.isdigit():
+                        aweme_id = candidate
+                if not aweme_id:
+                    raise HTTPException(
+                        400, "无法识别 TikTok 作品,请粘贴 "
+                        "https://www.tiktok.com/@用户/video/<id> 长链或纯数字 id"
+                        "(不支持短链)")
             else:
                 aweme_id = await resolve_aweme_id(target, cfg.engine.user_agent)
                 if not aweme_id:
@@ -9906,6 +10617,7 @@ def _task_dict(t: CommentTask) -> dict:
     return {
         "id": t.id, "platform": t.platform, "rule_id": t.rule_id,
         "account_id": t.account_id, "aweme_id": t.aweme_id,
+        "work_title": getattr(t, "work_title", "") or "",
         "target_comment_id": t.target_comment_id, "target_nick": t.target_nick,
         "target_text": getattr(t, "target_text", ""),
         "content": t.content, "status": t.status, "result": t.result,
@@ -9929,16 +10641,17 @@ async def list_comment_rules(platform: str | None = None):
 
 @app.post("/api/comment-rules")
 async def add_comment_rule(body: CommentRuleIn, request: Request = None):
+    _require_capability(body.platform, platforms.AUTO_COMMENT)
     with get_session() as s:
         previous = replay_if_exists(s, request=request, scope="comment-rule", body=body)
         if previous is not None:
             return previous
-    platform = body.platform if body.platform in ("douyin", "xhs", "kuaishou") else "douyin"
+    platform = body.platform if body.platform in platforms.keys_with(platforms.AUTO_COMMENT) else "douyin"
     mode = body.mode if body.mode in ("auto_reply", "auto_comment") else "auto_reply"
     templates = [t.strip() for t in body.templates if t.strip()]
     if not templates:
         raise HTTPException(400, "请至少配置一条文案模板(AI 生成失败时回退用)")
-    _pn = {"xhs": "小红书", "kuaishou": "快手"}.get(platform, "抖音")
+    _pn = platforms.label_of(platform, "抖音")
     with get_session() as s:
         acc = s.get(DouyinAccount, body.account_id)
         if not acc or acc.platform != platform:
@@ -10048,7 +10761,9 @@ async def del_comment_rule(rid: int, with_tasks: bool = True):
 async def run_comment_rule_now(rid: int):
     if not engine:
         raise HTTPException(503, "引擎未就绪")
-    return await engine.run_comment_rule(rid)
+    # 界面「试跑」为用户显式触发:发现阶段按交互读处理,绕过操作间隔/抖动等
+    # 软节奏,但仍受冷却/退避/人工验证/登录态等硬风控约束。
+    return await engine.run_comment_rule(rid, manual=True)
 
 
 @app.get("/api/comment-tasks")
@@ -10076,9 +10791,31 @@ async def run_comment_task_now(tid: int):
             raise HTTPException(404)
         if t.status not in ("pending", "failed"):
             raise HTTPException(400, f"任务状态为 {t.status}")
+        # 人工显式发送:清掉自动节流留下的延期/阻塞标记,软节奏由人工承担;
+        # 同时清账号级写暂停和人工验证标记(单任务触发的验证不应永久阻塞整号);
+        # 登录态失效、代理异常等硬门槛仍在执行链中拦截。
         t.status = "pending"; t.scheduled_at = None; t.error = ""
+        t.blocked_reason = ""; t.blocked_signal = ""
+        t.blocked_operation = ""; t.blocked_at = None
+        t.next_allowed_at = None
+        acc = s.get(DouyinAccount, t.account_id) if t.account_id else None
+        if acc and acc.write_paused_until:
+            acc.write_paused_until = None
+            acc.write_pause_reason = ""
+            s.add(acc)
+        # 清风控状态里的 manual_review_required
+        if t.account_id:
+            rstate = s.get(AccountRiskState, t.account_id)
+            if rstate and rstate.manual_review_required:
+                rstate.manual_review_required = False
+                rstate.manual_review_reason = ""
+                s.add(rstate)
         s.add(t); s.commit()
-    return await engine.execute_comment_task(tid)
+    try:
+        return await engine.execute_comment_task(tid, manual=True)
+    except AccountBusyError as exc:
+        # 账号正被同账号后台任务占用且等待超时:明确告知,前端不再无限“处理中”。
+        return {"ok": False, "error": str(exc), "busy": True}
 
 
 @app.post("/api/comment-tasks/{tid}/cancel")
@@ -10264,7 +11001,7 @@ async def test_channel(cid: int):
         if not c:
             raise HTTPException(404)
         ch_type, cfg = c.type, json.loads(c.config or "{}")
-    ok, detail = await send_one(ch_type, cfg, "CreatorHub · 测试通知",
+    ok, detail = await send_one(ch_type, cfg, "mmm · 测试通知",
                                 "这是一条测试消息,收到说明渠道配置正常 ✓")
     return {"ok": ok, "detail": redact_detail(ch_type, cfg, detail)}
 
@@ -10290,6 +11027,19 @@ async def index():
 
 
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
+
+
+@app.get("/cs-manifest.json")
+async def cs_manifest():
+    return FileResponse(str(WEB_DIR / "cs-manifest.json"),
+                        media_type="application/manifest+json")
+
+
+@app.get("/cs-sw.js")
+async def cs_service_worker():
+    return FileResponse(str(WEB_DIR / "cs-sw.js"),
+                        media_type="application/javascript",
+                        headers={"Service-Worker-Allowed": "/"})
 
 
 @app.get("/health")

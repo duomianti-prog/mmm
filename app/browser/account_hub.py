@@ -26,6 +26,11 @@ from .manager import BrowserManager
 from .xhs_dm import send_xhs_dm_page
 from .xhs_fetcher import fetch_xhs_notes
 from ..platforms.kuaishou import parse_self_user as parse_ks_self_user
+from ..platforms.tiktok import (
+    fetch_tiktok_self_profile,
+    fetch_tiktok_works,
+    norm_tiktok_work,
+)
 
 
 def _num(v) -> int:
@@ -279,6 +284,18 @@ async def fetch_account_works(mgr: BrowserManager, identity, platform: str, uid:
                 uid = self3x
         except Exception as e:
             print(f"[hub-self] kuaishou self-resolve failed: {e!r}")
+    elif platform == "tiktok" and not uid:
+        # TikTok 主页路由用 uniqueId(账号表里落在 douyin_id 列);
+        # 缺失时打开首页从本人资料补一次,避免要求用户先手动「刷新资料」。
+        try:
+            me, perr = await fetch_tiktok_self_profile(mgr, identity)
+            if perr == "logged_out":
+                return [], "logged_out:登录态失效,请重新登录"
+            handle = str(me.get("uniqueId") or "")
+            if handle:
+                uid = handle
+        except Exception as e:
+            print(f"[hub-self] tiktok self-resolve failed: {e!r}")
     # 视频号:助手接口即本账号,不需要 uid
     if not uid and not open_url and platform != "shipinhao":
         return [], "missing_uid:账号缺自身 uid,请先点账号「刷新资料」再同步作品"
@@ -301,6 +318,10 @@ async def fetch_account_works(mgr: BrowserManager, identity, platform: str, uid:
                                                         max_scrolls=max_scrolls,
                                                         open_url=open_url)
             norm = _norm_ks_work
+        elif platform == "tiktok":
+            items, err = await fetch_tiktok_works(
+                mgr, identity, uid, known, max_scrolls=max_scrolls)
+            norm = norm_tiktok_work
         else:
             items, _author, err = await fetch_videos(mgr, identity, uid, known,
                                                      max_scrolls=max_scrolls)
@@ -342,6 +363,7 @@ _ID_KEYS = ("user_id", "userId", "uid", "id", "red_id", "kwaiId")
 # 「强用户特征」字段:webpack 模块清单 {id,name} 没有这些,用来把模块/无关对象剔掉
 _STRONG_ID_KEYS = ("user_id", "userId", "uid", "sec_uid", "secUid", "red_id", "kwaiId")
 _AVATAR_KEYS = ("avatar", "avatar_thumb", "avatar_small", "avatar_larger",
+                "avatarLarger", "avatarMedium",
                 "avatarUrl", "avatar_url", "headurl",
                 "head_url", "headUrl", "image", "images", "icon")
 
@@ -587,6 +609,9 @@ _FOLLOW_PRECISE = {
     "douyin":   {"following": ("following/list",), "fan": ("follower/list",)},
     "xhs":      {"following": ("followings", "/follows"), "fan": ("fans", "/followers")},
     "kuaishou": {"following": (), "fan": ()},   # 快手走 graphql visionProfileUserList(见下)
+    # TikTok Web 列表 REST:/@handle/following 与 /followers 各自独立路由+独立接口
+    "tiktok":   {"following": ("/api/user/list/following/list",),
+                 "fan": ("/api/user/list/follower/list",)},
 }
 
 
@@ -620,9 +645,27 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
                 uid = self3x
         except Exception as e:
             print(f"[follow] kuaishou self-resolve failed: {e!r}")
-    if "{uid}" in nav["url"] and not uid and not self_url:
-        return [], "missing_uid:账号缺自身 uid,请先点账号「刷新资料」"
-    url = self_url or (nav["url"].format(uid=uid) if "{uid}" in nav["url"] else nav["url"])
+    elif platform == "tiktok" and not uid:
+        try:
+            me, perr = await fetch_tiktok_self_profile(mgr, identity)
+            if perr == "logged_out":
+                return [], "logged_out:登录态失效,请重新登录"
+            uid = str(me.get("uniqueId") or "")
+        except Exception as e:
+            print(f"[follow] tiktok self-resolve failed: {e!r}")
+    # TikTok 列表是独立路由(/@handle/following|followers),直接打开即出弹层,
+    # 不走 _FOLLOW_NAV 的"主页 + 点统计项"流程。
+    if platform == "tiktok":
+        if not uid:
+            return [], "missing_uid:账号缺 TikTok 号(uniqueId),请先点账号「刷新资料」"
+        url = (f"https://www.tiktok.com/@{uid}/"
+               + ("following" if direction == "following" else "followers"))
+    else:
+        nav = _FOLLOW_NAV.get(platform, _FOLLOW_NAV["douyin"])
+        if "{uid}" in nav["url"] and not uid and not self_url:
+            return [], "missing_uid:账号缺自身 uid,请先点账号「刷新资料」"
+        url = self_url or (nav["url"].format(uid=uid)
+                           if "{uid}" in nav["url"] else nav["url"])
 
     collected: Dict[str, dict] = {}     # 命中「关注/粉丝接口」的精确结果(优先)
     broad: Dict[str, dict] = {}          # 全页兜底(可能混入推荐位,仅当精确为空时启用)
@@ -644,7 +687,8 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
             pass
 
     host = {"douyin": "douyin.com", "xhs": "xiaohongshu.com",
-            "kuaishou": "kuaishou.com"}.get(platform, "douyin.com")
+            "kuaishou": "kuaishou.com", "tiktok": "tiktok.com"}.get(
+        platform, "douyin.com")
 
     precise_hints = _FOLLOW_PRECISE.get(platform, {}).get(direction, ())
 
@@ -693,6 +737,9 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
             expected_key = "followers" if direction == "fan" else "followings"
             if platform == "douyin" and isinstance(data.get(expected_key), list):
                 precise_empty_confirmed = len(data[expected_key]) == 0
+            if platform == "tiktok" and isinstance(data.get("userList"), list):
+                # userList: [] + statusCode 0 才是"真的为 0",和超时/未命中区分开
+                precise_empty_confirmed = len(data["userList"]) == 0
         found: List[dict] = []
         _harvest_user_lists(data, found)
         if not found:
@@ -730,8 +777,10 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
             except Exception as e:
                 print(f"[follow-probe] douyin probe failed: {e!r}")
         # 打开「当前方向」的列表:依次试候选入口,点完等该方向专属接口回包来确认开对了。
-        openers = nav.get("open", {}).get(direction, [])
-        opened = False
+        # TikTok 用 /@handle/following|followers 独立路由,导航即打开,无需点击。
+        openers = ([] if platform == "tiktok"
+                   else nav.get("open", {}).get(direction, []))
+        opened = platform == "tiktok"
         for cand in openers:
             try:
                 if cand.startswith("dyjs:"):

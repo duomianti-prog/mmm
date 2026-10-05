@@ -53,7 +53,7 @@ def build_update(app_dir, output_dir, version, base=None):
     validate_manifest(data)
     (output_dir / manifest_name(version)).write_text(json.dumps(data, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     # Include only this version's release artifacts, never stale packages or logs.
-    names = [f"CreatorHub-Setup-{version}-windows-x64.exe", manifest_name(version)]
+    names = [f"mmm-Setup-{version}-windows-x64.exe", manifest_name(version)]
     if data.get("delta"):
         names.append(data["delta"]["asset_name"])
     present = [output_dir / name for name in names if (output_dir / name).is_file()]
@@ -63,7 +63,7 @@ def build_update(app_dir, output_dir, version, base=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--app-dir", default="dist/windows/CreatorHub")
+    parser.add_argument("--app-dir", default="dist/windows/mmm")
     parser.add_argument("--output-dir", default="dist/installer")
     parser.add_argument("--version", default="0.2.0")
     parser.add_argument("--base-manifest")

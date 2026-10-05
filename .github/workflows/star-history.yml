@@ -31,7 +31,7 @@ jobs:
           theme: creatorhub
           style: card
           curve: smooth
-          title: CreatorHub
+          title: mmm
           show-growth: "true"
           animate: "true"
           branch: star-history

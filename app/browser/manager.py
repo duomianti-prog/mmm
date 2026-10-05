@@ -62,7 +62,7 @@ _ENVIRONMENT_CHECK_MARKER = "environment-check.json"
 
 
 class BrowserProfileConflictError(RuntimeError):
-    """账号 Profile 已被另一个 CreatorHub 进程占用。"""
+    """账号 Profile 已被另一个 mmm 进程占用。"""
 
 
 class _ProfileProcessLock:
@@ -295,6 +295,9 @@ class BrowserManager:
         # 优先使用机器上安装的稳定版 Chrome；没有时回退到 Patchright
         # 附带的 Chrome for Testing。登录窗口因此更接近用户日常浏览器环境。
         self._browser_channel: Optional[str] = None
+        # bundled Chromium（Patchright 自带）是否可用；_detect_chrome_major 回退成功后置 True，
+        # native 写操作门禁据此放行（与系统 Chrome 等价）。
+        self._bundled_chromium_ok: bool = False
 
     def register_fingerprint_runtime(
             self, runtime_id: str, executable_path: str, *,
@@ -393,7 +396,7 @@ class BrowserManager:
         )
 
     def _environment_check_marker_path(self, identity: Identity) -> Path:
-        # 放在账号 Profile 内的 CreatorHub 专用子目录中，仍随独立环境迁移，
+        # 放在账号 Profile 内的 mmm 专用子目录中，仍随独立环境迁移，
         # 也不会写入系统盘或共享全局目录。
         return (
             self._environment_profile_dir(identity)
@@ -514,6 +517,8 @@ class BrowserManager:
             except Exception:
                 continue
             self._browser_channel = channel
+            # bundled Chromium（channel=None）同样可用：写操作门禁据此放行
+            self._bundled_chromium_ok = channel is None or self._bundled_chromium_ok
             try:
                 pg = await browser.new_page()
                 ua = await pg.evaluate("navigator.userAgent")
@@ -936,8 +941,10 @@ class BrowserManager:
             )
         if self.native_write_require_system_chrome \
                 and self._browser_channel != "chrome" \
+                and not self._bundled_chromium_ok \
                 and effective_backend != FINGERPRINT_CHROMIUM_BACKEND:
-            return "write_env_blocked:未检测到系统稳定版 Chrome 或可用指纹 Chromium"
+            return ("write_env_blocked:未检测到可用浏览器内核"
+                    "(请安装 Chrome,或在「引擎设置」中启用指纹 Chromium 内核)")
         proxy = str(getattr(account, "proxy", "") or "").strip()
         if not proxy or not self.native_write_require_verified_proxy:
             return ""
@@ -1055,6 +1062,13 @@ class BrowserManager:
             kwargs["no_viewport"] = True
             if proxy:
                 kwargs["args"] = list(_PROXY_WEBRTC_ARGS)
+        # 平台要求语言/时区与出口绑定(TikTok):即使 native 画像也不跟随宿主系统,
+        # 避免中文界面/东八区与海外代理出口矛盾。
+        if not fingerprint_plan and identity.pin_context_locale:
+            kwargs["locale"] = identity.locale or "en-US"
+            kwargs["timezone_id"] = identity.timezone_id or "America/New_York"
+            kwargs.setdefault("geolocation", identity.geolocation)
+            kwargs.setdefault("permissions", ["geolocation"])
         if proxy:
             kwargs["proxy"] = proxy
         try:
@@ -1530,7 +1544,7 @@ class BrowserManager:
 
         ``foreground=False`` is for routine background reads/writes. It keeps
         the same headed Chrome process and tab, but does not steal focus from
-        the CreatorHub window. Login and explicit "open browser" operations
+        the mmm window. Login and explicit "open browser" operations
         retain the foreground default.
         """
         retain = (
@@ -1733,6 +1747,7 @@ _COOKIE_DOMAIN = {
     "xhs": ".xiaohongshu.com",
     "kuaishou": ".kuaishou.com",
     "shipinhao": ".weixin.qq.com",   # 视频号:finder 登录态(_finder_auth/sessionid)挂在 .weixin.qq.com
+    "tiktok": ".tiktok.com",
 }
 
 

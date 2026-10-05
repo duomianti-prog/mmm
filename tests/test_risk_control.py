@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 import asyncio
@@ -42,6 +43,9 @@ class _BrowserStub:
 
 class RiskControlTests(unittest.TestCase):
     def setUp(self):
+        # lifespan 仅在授权门控通过时启动采集栈；本类用例与授权无关
+        self._prev_skip_license = os.environ.get("CREATORHUB_SKIP_LICENSE")
+        os.environ["CREATORHUB_SKIP_LICENSE"] = "1"
         self.previous_engine = db._engine
         self.tmp = tempfile.TemporaryDirectory()
         db.init_db(str(Path(self.tmp.name) / "risk.db"))
@@ -52,6 +56,10 @@ class RiskControlTests(unittest.TestCase):
             db._engine.dispose()
         db._engine = self.previous_engine
         self.tmp.cleanup()
+        if self._prev_skip_license is None:
+            os.environ.pop("CREATORHUB_SKIP_LICENSE", None)
+        else:
+            os.environ["CREATORHUB_SKIP_LICENSE"] = self._prev_skip_license
 
     def _account(self, *, timezone_id="Asia/Shanghai", proxy=""):
         with db.get_session() as session:

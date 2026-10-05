@@ -264,11 +264,17 @@ def parse_creator_comment(raw: dict) -> Optional[dict]:
         return None
     user = raw.get("user") or raw.get("commenter") or raw.get("user_info") or {}
     aweme_id = str(_first(raw, "aweme_id", "item_id", "group_id", "object_id",
-                          default="") or "")
+                          "awemeId", "itemId", default="") or "")
+    aweme_desc = _first(raw, "aweme_desc", "video_desc", "desc", default="") or ""
+    if not aweme_desc:
+        aweme = raw.get("aweme") or raw.get("video") or raw.get("item") or {}
+        if isinstance(aweme, dict):
+            aweme_desc = str(aweme.get("desc") or "").strip()
     return {
         "aweme_id": aweme_id,
         "comment_id": cid,
         "text": str(_first(raw, "text", "content", "comment_text", default="")).strip(),
+        "aweme_desc": aweme_desc,
         "user_nickname": _first(user, "nickname", "name", "user_name", default="") or "",
         "user_sec_uid": str(_first(
             user, "sec_uid", "secUid", "sec_user_id", "secUserId", default="") or ""),

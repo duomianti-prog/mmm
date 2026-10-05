@@ -120,7 +120,7 @@ class DesktopShellTests(unittest.TestCase):
             worker.join(timeout=40)
             self.assertFalse(worker.is_alive())
             self.assertEqual(self.controller.state()["phase"], "stopped")
-        self.assertTrue((self.home / "data" / "creatorhub.db").exists())
+        self.assertTrue((self.home / "data" / "mmmim.db").exists())
 
     def test_leftover_owned_child_prevents_duplicate_start(self):
         self.controller.phase = "error"

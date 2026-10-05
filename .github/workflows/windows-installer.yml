@@ -85,11 +85,11 @@ jobs:
       - name: Package Python, application and offline guide
         run: python desktop/build_windows.py --version $env:APP_VERSION
       - name: Test frozen updater handoff with disposable fixtures
-        run: python desktop/smoke_update_windows.py dist/windows/CreatorHub/_internal/desktop/CreatorHubUpdater.exe
+        run: python desktop/smoke_update_windows.py dist/windows/mmm/_internal/desktop/mmmUpdater.exe
       - name: Test frozen file delta and automatic rollback
-        run: python desktop/smoke_update_windows.py dist/windows/CreatorHub/_internal/desktop/CreatorHubUpdater.exe --delta
+        run: python desktop/smoke_update_windows.py dist/windows/mmm/_internal/desktop/mmmUpdater.exe --delta
       - name: Smoke-test frozen resources and service lifecycle
-        run: python desktop/smoke_windows.py dist/windows/CreatorHub/CreatorHub.exe
+        run: python desktop/smoke_windows.py dist/windows/mmm/mmm.exe
       - name: Download verified WebView2 bootstrapper
         run: ./desktop/prepare_webview2.ps1
       - name: Compile installer
@@ -100,7 +100,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $compiler "/DAppVersion=$env:APP_VERSION" desktop/installer.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $file = Get-Item "dist/installer/CreatorHub-Setup-$env:APP_VERSION-windows-x64.exe"
+          $file = Get-Item "dist/installer/mmm-Setup-$env:APP_VERSION-windows-x64.exe"
           "$((Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLower())  $($file.Name)" | Set-Content dist/installer/SHA256.txt -Encoding ascii
       - name: Fetch verified previous release inventory
         run: python desktop/fetch_update_base.py --version $env:APP_VERSION
@@ -108,7 +108,7 @@ jobs:
         run: python desktop/build_update.py --version $env:APP_VERSION --base-manifest build/windows/update-base.json
       - uses: actions/upload-artifact@v4
         with:
-          name: CreatorHub-Windows-Installer
+          name: mmm-Windows-Installer
           path: dist/installer/*
           if-no-files-found: error
 
@@ -121,7 +121,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: CreatorHub-Windows-Installer
+          name: mmm-Windows-Installer
           path: installer
       - name: Publish installer and checksum
         env:
@@ -141,10 +141,10 @@ jobs:
               exit 0
             fi
           else
-            gh release create "$TAG" --verify-tag --draft --title "CreatorHub $TAG" --notes-file RELEASE_NOTES.md
+            gh release create "$TAG" --verify-tag --draft --title "mmm $TAG" --notes-file RELEASE_NOTES.md
           fi
-          assets=("CreatorHub-Setup-$APP_VERSION-windows-x64.exe" "CreatorHub-Update-$APP_VERSION-windows-x64.json" SHA256.txt)
-          for delta in CreatorHub-Delta-*-to-"$APP_VERSION"-windows-x64.zip; do
+          assets=("mmm-Setup-$APP_VERSION-windows-x64.exe" "mmm-Update-$APP_VERSION-windows-x64.json" SHA256.txt)
+          for delta in mmm-Delta-*-to-"$APP_VERSION"-windows-x64.zip; do
             [ ! -f "$delta" ] || assets+=("$delta")
           done
           gh release upload "$TAG" "${assets[@]}" --clobber

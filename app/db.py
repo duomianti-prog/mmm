@@ -1,6 +1,9 @@
 """数据库初始化与会话。含 SQLite 轻量自动迁移(为已有表补缺失列)。"""
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
+
 from sqlalchemy import event, func, inspect, select, text
 from sqlmodel import SQLModel, Session, create_engine
 
@@ -8,8 +11,37 @@ from .models import (AccountIdReservation, DouyinAccount, ContentRecord,
                      MonitorIdReservation, MonitorTarget, CommentWatch,
                      CommentRecord, CommentWatchIdReservation, DanmakuWatch,
                      DanmakuRecord, DanmakuWatchIdReservation)
+# 客服表同样纳入 create_all / _auto_migrate 元数据（仅导入，无循环依赖）
+from .cs import models as _cs_models  # noqa: F401
 
 _engine = None
+
+# 数据库默认文件名历史是 creatorhub.db，客服服务器场景更名为 mmmim.db。
+# 旧部署升级时 init_db 会自动把 creatorhub.db 重命名为 mmmim.db，
+# 前提是目标还不存在；两个文件同时存在则尊重新文件，不碰旧文件。
+LEGACY_DB_BASENAME = "creatorhub.db"
+
+
+def _migrate_legacy_db_name(db_path: str) -> str:
+    path = Path(db_path)
+    if path.name == LEGACY_DB_BASENAME:
+        return db_path  # 显式沿用旧名，不做迁移
+    legacy = path.with_name(LEGACY_DB_BASENAME)
+    if path.exists() or not legacy.exists():
+        return db_path
+    try:
+        legacy.rename(path)
+        print(f"[db] 已将数据库 {legacy.name} 迁移为 {path.name}", flush=True)
+    except OSError as exc:
+        # 跨盘符重命名失败时复制，避免丢数据；复制失败回退继续使用旧库
+        try:
+            shutil.copy2(legacy, path)
+            print(f"[db] 已将数据库 {legacy.name} 复制为 {path.name}", flush=True)
+        except OSError as copy_exc:
+            print(f"[db] 数据库迁移失败({exc!r}/{copy_exc!r})，继续使用 {legacy.name}",
+                  flush=True)
+            return str(legacy)
+    return str(path)
 
 
 @event.listens_for(DouyinAccount, "before_insert")
@@ -136,6 +168,18 @@ def _auto_migrate(engine):
                 ddl += " DEFAULT ''"
             with engine.begin() as conn:
                 conn.execute(text(ddl))
+        if table.name == "csmessage" and "idem_key" in {
+                col.name for col in table.columns}:
+            # 旧库升级：在创建幂等唯一索引之前回填历史平台消息。
+            # legacy:<conv_id>:<platform_msg_id> 全局唯一（旧逻辑按会话内去重），
+            # 新键形如 "<source>|<scope>|<mid>"，不会与之冲突。
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    UPDATE csmessage
+                       SET idem_key = 'legacy:' || conv_id || ':' || platform_msg_id
+                     WHERE COALESCE(idem_key, '') = ''
+                       AND COALESCE(platform_msg_id, '') != ''
+                """))
         # create_all() skips an existing table together with indexes added in a
         # later release. Create named model indexes explicitly so upgraded
         # installations receive the same query plan as fresh installations.
@@ -151,6 +195,7 @@ def _auto_migrate(engine):
 
 def init_db(db_path: str):
     global _engine
+    db_path = _migrate_legacy_db_name(db_path)
     _engine = create_engine(
         f"sqlite:///{db_path}",
         connect_args={"check_same_thread": False},

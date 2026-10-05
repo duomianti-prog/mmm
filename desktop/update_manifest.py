@@ -24,13 +24,13 @@ def version_tuple(value):
 
 def manifest_name(version):
     version_tuple(version)
-    return f"CreatorHub-Update-{version}-windows-x64.json"
+    return f"mmm-Update-{version}-windows-x64.json"
 
 
 def delta_name(base, version):
     version_tuple(base)
     version_tuple(version)
-    return f"CreatorHub-Delta-{base}-to-{version}-windows-x64.zip"
+    return f"mmm-Delta-{base}-to-{version}-windows-x64.zip"
 
 
 def valid_digest(value):
@@ -46,7 +46,7 @@ def file_path(value):
             not p or p in {".", ".."} or p.endswith((".", " "))
             or re.search(r'[<>:"\\|?*\x00-\x1f]', p) or re.fullmatch(reserved, p)
             for p in parts)
-            or not (value == "CreatorHub.exe" or (len(parts) > 1 and parts[0] == "_internal"))):
+            or not (value == "mmm.exe" or (len(parts) > 1 and parts[0] == "_internal"))):
         raise ValueError("Manifest names a non-application path")
     return value
 

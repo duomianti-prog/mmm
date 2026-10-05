@@ -66,7 +66,7 @@ class GuideSiteTests(unittest.TestCase):
             build_guide(target)
             actual = {p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_file()}
             expected = {"index.html", "guide.css"} | {f"images/{name}" for name in GUIDE_IMAGES}
-            expected |= {f"{platform}/index.html" for platform in ("douyin", "xhs", "kuaishou", "shipinhao")}
+            expected |= {f"{platform}/index.html" for platform in ("douyin", "xhs", "kuaishou", "tiktok", "shipinhao")}
             self.assertEqual(actual, expected)
 
     def test_readme_community_uses_direct_qr_images(self):
@@ -111,7 +111,7 @@ class GuideSiteTests(unittest.TestCase):
             # that alias; normalize both sides before checking containment.
             target = Path(tmp).resolve()
             build_guide(target)
-            for slug in ("douyin", "xhs", "kuaishou", "shipinhao"):
+            for slug in ("douyin", "xhs", "kuaishou", "tiktok", "shipinhao"):
                 page = target / slug / "index.html"
                 parsed_page = self.parse(page)
                 self.assertEqual(len(parsed_page.ids), len(set(parsed_page.ids)))

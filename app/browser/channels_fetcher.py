@@ -14,10 +14,13 @@
 """
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Optional, Set, Tuple
 
 from .identity import Identity
 from .manager import BrowserManager
+
+log = logging.getLogger("creatorhub.channels")
 
 BASE = "https://channels.weixin.qq.com"
 PLATFORM_URL = BASE + "/platform"
@@ -34,6 +37,15 @@ AUTH_API = "mmfinderassistant-bin/auth/"          # get_auth_info / auth_data
 POST_LIST_API = "mmfinderassistant-bin/post/post_list"
 STAT_API = "mmfinderassistant-bin/statistic/post_list"
 COMMENT_API = "mmfinderassistant-bin/comment/"
+# 评论回复提交接口(replyComment / reply / add 均做兜底,以真实抓包为准)
+COMMENT_REPLY_MARKERS = ("comment/reply", "comment/add", "comment/commentreply")
+
+# 评论管理页候选路由(助手改版后路径可能变化,逐个尝试,任一拦到评论即停)。
+# 末位兜底:作品列表页带 objectId query(旧实现行为)。
+COMMENT_LIST_URLS = (
+    BASE + "/platform/comment/manage",
+    BASE + "/platform/comment",
+)
 
 
 def _rf(d: dict, *keys, default=""):
@@ -64,7 +76,8 @@ def _dig_posts(data: dict) -> list:
 
 def _dig_comments(data: dict) -> list:
     d = _dig_data(data)
-    for key in ("comment", "comments", "commentList", "list", "root_comments"):
+    for key in ("comment", "comments", "commentList", "rootComments",
+                "objectComments", "list", "root_comments"):
         v = d.get(key)
         if isinstance(v, list):
             return v
@@ -254,19 +267,26 @@ async def fetch_channels_comments(mgr: BrowserManager, identity: Identity,
                                   block_media: bool = True
                                   ) -> Tuple[List[dict], str]:
     """打开某条本账号作品的评论管理,拦截 comment 接口收集评论。
-    返回 (新评论原始列表, error)。⚠️ 评论管理页 URL 需校准(下面用 query 传 objectId 兜底)。"""
+    返回 (新评论原始列表, error)。
+    评论管理页路径随助手改版可能变化:依次尝试 COMMENT_LIST_URLS,任一页面拦到
+    comment 接口数据即停止;全部失败再退回旧的「作品列表页?objectId=」兜底。"""
     collected: Dict[str, dict] = {}
     error = ""
     api_seen: list = []
+    comment_api_seen = False
+    final_urls: list = []
+    navigation_errors: list = []
     page = await mgr.new_page(identity, block_media)
 
     async def on_response(resp):
+        nonlocal comment_api_seen
         url = resp.url
         if "mmfinderassistant-bin" in url and len(api_seen) < 40:
             p = url.split("?")[0].split("mmfinderassistant-bin")[-1]
             api_seen.append(f"{resp.status} {p}")
         if COMMENT_API not in url:
             return
+        comment_api_seen = True
         try:
             data = await resp.json()
         except Exception:
@@ -276,12 +296,14 @@ async def fetch_channels_comments(mgr: BrowserManager, identity: Identity,
             if cid:
                 collected[cid] = c
 
-    page.on("response", on_response)
-    try:
-        # 评论管理页路径未定,先落作品管理页(其内可展开评论),URL 需真机校准
-        await page.goto(f"{POST_LIST_URL}?objectId={object_id}",
-                        wait_until="domcontentloaded", timeout=30000)
+    async def _scan_url(list_url: str) -> None:
+        nonlocal error
+        await page.goto(list_url, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(settle_ms)
+        final_urls.append(page.url)
+        if "/login" in page.url or "login.html" in page.url:
+            error = "logged_out:登录态失效,请重新登录"
+            return
         stagnant = 0
         for _ in range(max_scrolls):
             before = len(collected)
@@ -296,8 +318,21 @@ async def fetch_channels_comments(mgr: BrowserManager, identity: Identity,
                     break
             else:
                 stagnant = 0
-    except Exception as e:
-        error = f"打开评论页失败: {e!r}"
+
+    page.on("response", on_response)
+    try:
+        candidate_urls = list(COMMENT_LIST_URLS) + [
+            f"{POST_LIST_URL}?objectId={object_id}"]
+        for list_url in candidate_urls:
+            try:
+                await _scan_url(list_url)
+            except Exception as e:
+                navigation_errors.append(f"{list_url}: {e!r}")
+                continue
+            if error:        # logged_out 等致命错误,不必再试下一个路由
+                break
+            if collected:
+                break
     finally:
         try:
             await page.close()
@@ -305,8 +340,15 @@ async def fetch_channels_comments(mgr: BrowserManager, identity: Identity,
             pass
 
     if not collected and not error:
-        error = "未拦截到评论(评论管理页 URL 需校准,见 api_seen 日志)"
+        if navigation_errors:
+            error = "打开评论页失败: " + "; ".join(navigation_errors)
+        elif comment_api_seen:
+            error = "评论接口已响应但未解析到评论数据(字段结构可能变化,见 api_seen 日志)"
+        else:
+            error = ("未拦截到评论(评论管理页入口可能改版或该作品暂无评论)。"
+                     "已尝试路由: " + " | ".join(final_urls or candidate_urls))
         print(f"[channels_comments] object_id={object_id} "
+              f"comment_api_seen={comment_api_seen} "
               f"api_seen({len(api_seen)})={api_seen[:40]}")
     new = [c for cid, c in collected.items() if cid not in known_cids]
     return new, error
@@ -326,13 +368,73 @@ _COMMENT_SUBMIT = [
 ]
 
 
+def _mm_business_ok(data: dict) -> Tuple[bool, str]:
+    """mmfinderassistant 业务返回是否成功。(errCode==0 / baseResponse.retCode==0)。
+    返回 (ok, msg)。拿不到业务码时返回 (True, "") —— 不阻断,由调用方按「未确认」处理。"""
+    if not isinstance(data, dict):
+        return True, ""
+    if "errCode" in data or "err_code" in data:
+        code = data.get("errCode", data.get("err_code"))
+        if code not in (0, "0", None, ""):
+            return False, str(data.get("errMsg") or data.get("err_msg") or code)
+        return True, str(data.get("errMsg") or "")
+    base = data.get("baseResponse")
+    if isinstance(base, dict) and ("retCode" in base or "ret_code" in base):
+        code = base.get("retCode", base.get("ret_code"))
+        if code not in (0, "0", None, ""):
+            return False, str(base.get("retMsg") or code)
+        return True, ""
+    return True, ""
+
+
+async def _find_in_page_frames(page, selectors):
+    """主 frame + 所有子 frame(wujie iframe)里找第一个命中的定位器。
+    Patchright 定位器穿透**开放** shadowRoot,但不穿 iframe,故必须遍历 frames。
+    返回 (locator, frame) 或 (None, None)。"""
+    for frame in page.frames:
+        for sel in selectors:
+            try:
+                loc = frame.locator(sel).first
+                if await loc.count():
+                    return loc, frame
+            except Exception:
+                continue
+    return None, None
+
+
+async def _collect_comment_diag(page, tag: str) -> str:
+    """采集评论页紧凑 DOM 诊断(拼进错误文案 + 打日志):每 frame 报 host、
+    textarea/contenteditable 数、按钮文案前 8 个。"""
+    parts = []
+    try:
+        for i, fr in enumerate(page.frames):
+            try:
+                info = await fr.evaluate("""() => {
+                    const q = (s) => document.querySelectorAll(s).length;
+                    const btns = [...document.querySelectorAll('button,[role=button],.weui-desktop-btn')]
+                        .map(b => (b.innerText||'').trim()).filter(Boolean).slice(0, 8);
+                    const host = (location.host||'') + (location.pathname||'');
+                    return `${host} ta=${q('textarea')} ce=${q('[contenteditable=true]')} btn=[${btns.join('/')}]`;
+                }""")
+                parts.append(f"f{i}:{info}")
+            except Exception:
+                parts.append(f"f{i}:eval_err")
+    except Exception:
+        pass
+    summary = " | ".join(parts) or "无 frame 信息"
+    log.warning("[channels_comment/%s] %s", tag, summary)
+    return summary
+
+
 async def post_channels_comment(mgr: BrowserManager, identity: Identity, object_id: str,
                                 content: str, reply_to_text: str = "", headed: bool = True,
                                 settle_ms: int = 1800, timeout_ms: int = 12000
                                 ) -> Tuple[bool, str]:
     """在视频号评论管理页回复本账号作品的评论。
     ⚠️ 视频号「主动去别人作品下评论」在助手端不可行 —— 只支持回复自己作品的评论(auto_reply)。
-    选择器需校准,集中在 _COMMENT_INPUT / _COMMENT_SUBMIT。返回 (ok, error)。"""
+    评论 UI 在 wujie iframe 内,定位器遍历全部 frame;提交后以 comment/reply* 接口
+    业务回包作为成功判据(证据化,避免「点了就当成功」)。选择器集中在
+    _COMMENT_INPUT / _COMMENT_SUBMIT。返回 (ok, error)。"""
     content = (content or "").strip()
     if not content:
         return False, "空文案"
@@ -342,41 +444,85 @@ async def post_channels_comment(mgr: BrowserManager, identity: Identity, object_
         page = await ctx.new_page()
     else:
         page = await mgr.new_page(identity, block_media=False)
-    try:
-        await page.goto(f"{POST_LIST_URL}?objectId={object_id}",
-                        wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(settle_ms)
-        if "/login" in page.url or "login.html" in page.url:
-            return False, "logged_out:视频号未登录,无法回复评论"
 
+    # 拦截评论回复提交接口,以业务回包判定成败(对标快手评论的证据化确认)
+    reply = {"seen": False, "ok": False, "msg": ""}
+
+    async def on_response(resp):
+        if reply["seen"]:
+            return
+        url = resp.url
+        if not any(m in url for m in COMMENT_REPLY_MARKERS):
+            return
+        try:
+            data = await resp.json()
+        except Exception:
+            return
+        reply["seen"] = True
+        reply["ok"], reply["msg"] = _mm_business_ok(data)
+
+    page.on("response", on_response)
+    try:
+        # 评论管理页路由可能改版:逐个候选页找回复框,任一页面找到即用
+        candidate_urls = list(COMMENT_LIST_URLS) + [
+            f"{POST_LIST_URL}?objectId={object_id}"]
         editor = None
-        for sel in _COMMENT_INPUT:
-            loc = page.locator(sel).first
-            try:
-                if await loc.count():
-                    editor = loc
-                    break
-            except Exception:
-                continue
+        opened_url = ""
+        for url in candidate_urls:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(settle_ms)
+            if "/login" in page.url or "login.html" in page.url:
+                return False, "logged_out:视频号未登录,无法回复评论"
+            editor, _fr = await _find_in_page_frames(page, _COMMENT_INPUT)
+            if editor is not None:
+                opened_url = url
+                break
         if editor is None:
-            return False, "未找到评论回复框(评论管理页选择器需校准)"
+            diag = await _collect_comment_diag(page, "no-reply-editor")
+            return False, (f"未找到评论回复框(评论管理页选择器可能改版,或该作品暂无可回复评论)。"
+                          f"DOM诊断: {diag}")
+
         await editor.click(timeout=timeout_ms)
         await page.keyboard.type(content, delay=40)
         await page.wait_for_timeout(500)
         sent = False
         for sel in _COMMENT_SUBMIT:
             try:
-                btn = page.locator(sel).first
-                if await btn.count() and await btn.is_enabled():
+                btn = None
+                for frame in page.frames:
+                    loc = frame.locator(sel).first
+                    if await loc.count() and await loc.is_enabled():
+                        btn = loc
+                        break
+                if btn is not None:
                     await btn.click(timeout=3000)
                     sent = True
                     break
             except Exception:
                 continue
         if not sent:
-            return False, "未找到发送按钮(选择器需校准)"
-        await page.wait_for_timeout(1500)
-        return True, ""
+            try:
+                await page.keyboard.press("Enter")
+                sent = True
+            except Exception:
+                pass
+        if not sent:
+            diag = await _collect_comment_diag(page, "no-submit-btn")
+            return False, f"未找到发送按钮且回车提交失败。DOM诊断: {diag}"
+
+        # 等回复接口业务回包(最多 ~9s);拿不到回包不算成功,要求人工核对
+        for _ in range(30):
+            if reply["seen"]:
+                break
+            await page.wait_for_timeout(300)
+        if reply["seen"]:
+            if reply["ok"]:
+                return True, ""
+            return False, (f"视频号拒绝回复({reply['msg'] or '未知原因'})—— "
+                           "多为频控/风控或内容不合规,请降低频率或稍后再试")
+        diag = await _collect_comment_diag(page, "reply-unconfirmed")
+        return False, ("未捕获到视频号回复接口响应,无法确认是否成功"
+                       f"(回复页: {opened_url});请人工核对该作品评论区。DOM诊断: {diag}")
     except Exception as e:
         return False, f"回复评论异常: {e!r}"
     finally:

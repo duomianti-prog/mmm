@@ -67,7 +67,7 @@ def read_request(filename):
     if kind not in {"full", "delta"}:
         raise ValueError("Unsupported update kind")
     expected_name = (delta_name(data.get("from_version"), data["version"]) if kind == "delta"
-                     else f"CreatorHub-Setup-{data['version']}-windows-x64.exe")
+                     else f"mmm-Setup-{data['version']}-windows-x64.exe")
     if (data["installer"].parent != stage or data["installer"].name != expected_name
             or not data["installer"].is_file()):
         raise ValueError("Invalid staged installer")
@@ -76,7 +76,7 @@ def read_request(filename):
             or not isinstance(data.get("sha256"), str)
             or not re.fullmatch(r"[a-f0-9]{64}", data["sha256"])):
         raise ValueError("Invalid update identity or digest")
-    executable = data["install_dir"] / "CreatorHub.exe"
+    executable = data["install_dir"] / "mmm.exe"
     current = (data["install_dir"] / "_internal" / "desktop-version.txt").read_text(encoding="utf-8").strip()
     if not executable.is_file() or target <= numeric_version(current):
         raise ValueError("Only a newer version may be installed")
@@ -224,7 +224,7 @@ def restart_app(data):
 
 def notify_user(message):
     if os.name == "nt":
-        ctypes.windll.user32.MessageBoxW(None, message, "CreatorHub 更新", 0x30)
+        ctypes.windll.user32.MessageBoxW(None, message, "mmm 更新", 0x30)
 
 
 def apply_update(filename):
@@ -286,7 +286,7 @@ def apply_update(filename):
             # Persist the result even if the GUI is damaged or a reboot is needed.
             result.update(status="install_error", reason="restart")
             atomic_json(data["home"] / "runtime" / "update-result.json", result)
-            notify_user("更新后的启动中心尚未打开。请重新启动 CreatorHub；如仍未打开，使用安装包修复安装。账号与备份保留在用户目录。")
+            notify_user("更新后的启动中心尚未打开。请重新启动 mmm；如仍未打开，使用安装包修复安装。账号与备份保留在用户目录。")
     return 0 if result["status"] in {"installed", "restart_required"} else 1
 
 
@@ -318,7 +318,7 @@ def recover_update(home, parent_pid=0):
     parent = None
     try:
         if parent_pid:
-            parent = ParentProcess(parent_pid, journal["install_dir"] / "CreatorHub.exe")
+            parent = ParentProcess(parent_pid, journal["install_dir"] / "mmm.exe")
             atomic_json(home / "runtime/update-recovery-ready.json", {"pid": parent_pid})
             parent.wait(home / "runtime/update-recovery-cancel")
         with ExitStack() as stack:
@@ -327,7 +327,7 @@ def recover_update(home, parent_pid=0):
             rollback(home, journal)
             atomic_json(home / "runtime/update-result.json", {"status": "install_error",
                         "version": journal["version"], "reason": "recovered", "prefer_full": True})
-        restart_app({"home": home, "executable": journal["install_dir"] / "CreatorHub.exe"})
+        restart_app({"home": home, "executable": journal["install_dir"] / "mmm.exe"})
         return 0
     finally:
         if parent:

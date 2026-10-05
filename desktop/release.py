@@ -34,7 +34,7 @@ def release_notes(root, version):
     notes = text[heading.end():end].strip()
     if not notes or len(notes) > 45000:
         raise ValueError("本版更新说明应有实际内容，且不超过 45000 个字符。")
-    return f"# CreatorHub v{version}\n\n{notes}\n"
+    return f"# mmm v{version}\n\n{notes}\n"
 
 
 def git_executable():
@@ -99,13 +99,13 @@ def publish_plan(root, plan, git):
         raise ValueError("确认期间代码或更新说明有变化，请重新运行发布命令。")
     tag = plan["tag"]
     if not current["local_tag"]:
-        git("tag", "-a", tag, plan["head"], "-m", f"发布 CreatorHub v{plan['version']}")
+        git("tag", "-a", tag, plan["head"], "-m", f"发布 mmm v{plan['version']}")
     # On failure keep the local tag. Re-running can retry it, never force-replace it.
     git("push", "origin", f"refs/tags/{tag}:refs/tags/{tag}")
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="CreatorHub 发布助手：检查后确认推送版本标签，由 Actions 构建发布。")
+    parser = argparse.ArgumentParser(description="mmm 发布助手：检查后确认推送版本标签，由 Actions 构建发布。")
     parser.add_argument("version", help="本次版本号，例如 0.2.0")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="只检查，不创建或推送标签")

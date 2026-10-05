@@ -2,7 +2,11 @@ import asyncio
 import unittest
 
 import app.main  # noqa: F401 - initializes the package import graph used by browser modules
-from app.browser.ks_fetcher import _dig_comments, _extract_rest_profile
+from app.browser.ks_fetcher import (
+    _COMMENT_ADD_ENDPOINTS,
+    _dig_comments,
+    _extract_rest_profile,
+)
 from app.browser.login import (
     _KS_HOME_URL,
     _click_ks_login_button,
@@ -202,6 +206,53 @@ class KuaishouPublishRouteTests(unittest.TestCase):
         self.assertEqual(page.requested_name, "上传图片")
         self.assertTrue(page.button.clicked)
         self.assertEqual(page.chooser.files, ["one.png", "two.jpg"])
+
+
+class KuaishouCommentEndpointTests(unittest.TestCase):
+    """Task 22: 评论提交接口端点多候选守门"""
+
+    def test_comment_add_endpoints_include_variants(self):
+        # 必须包含主端点
+        self.assertIn("/rest/v/photo/comment/add", _COMMENT_ADD_ENDPOINTS)
+        # 必须包含 V2 变体
+        self.assertIn("/rest/v/photo/comment/addV2", _COMMENT_ADD_ENDPOINTS)
+        # 必须包含 commentAdd 变体
+        self.assertIn("/rest/v/photo/comment/commentAdd", _COMMENT_ADD_ENDPOINTS)
+
+    def test_comment_add_endpoints_are_unique(self):
+        # 无重复端点
+        self.assertEqual(len(_COMMENT_ADD_ENDPOINTS), len(set(_COMMENT_ADD_ENDPOINTS)))
+
+    def test_comment_add_endpoints_match_url_fragments(self):
+        # 每个端点都能匹配到包含它的 URL
+        test_urls = [
+            "https://www.kuaishou.com/rest/v/photo/comment/add?photoId=123",
+            "https://www.kuaishou.com/rest/v/photo/comment/addV2",
+            "https://www.kuaishou.com/rest/v/photo/comment/commentAdd",
+        ]
+        for url in test_urls:
+            matched = any(ep in url for ep in _COMMENT_ADD_ENDPOINTS)
+            self.assertTrue(matched, f"URL {url} 未匹配到任何候选端点")
+
+
+class KuaishouLoginDiagTests(unittest.TestCase):
+    """Task 22: 登录按钮 DOM 诊断守门"""
+
+    def test_click_ks_login_button_returns_false_without_match(self):
+        # 没有可见按钮时返回 False，并触发诊断打印
+        page = _LoginPage([])
+        result = asyncio.run(_click_ks_login_button(page, ("selector",)))
+        self.assertFalse(result)
+
+    def test_click_ks_login_button_still_clicks_visible(self):
+        # 可见按钮仍能被点击（向后兼容）
+        hidden = _LoginCandidate(False)
+        visible = _LoginCandidate(True)
+        page = _LoginPage([hidden, visible])
+        clicked = asyncio.run(_click_ks_login_button(page, ("selector",)))
+        self.assertTrue(clicked)
+        self.assertFalse(hidden.clicked)
+        self.assertTrue(visible.clicked)
 
 
 if __name__ == "__main__":

@@ -565,7 +565,8 @@ def _ks_web_login_ready(cookie_names) -> bool:
 
 
 async def _click_ks_login_button(page, selectors) -> bool:
-    """只点击可见的登录按钮，避免旧的 ``[class*=login]`` 点中整块容器。"""
+    """只点击可见的登录按钮，避免旧的 ``[class*=login]`` 点中整块容器。
+    若全部候选都未命中，打印页面上所有按钮文案用于诊断(不抛异常)。"""
     for selector in selectors:
         try:
             loc = page.locator(selector)
@@ -577,6 +578,17 @@ async def _click_ks_login_button(page, selectors) -> bool:
                 return True
         except Exception:
             continue
+    # 诊断：记录页面上可见的按钮/role=button 元素文案
+    try:
+        btns = await page.evaluate("""() => {
+            return [...document.querySelectorAll('button,[role="button"]')]
+                .map(b => (b.innerText||'').trim())
+                .filter(t => t.length > 0 && t.length < 80);
+        }""")
+        print(f"[ks_login_diag] 未命中任何登录按钮选择器;"
+              f" 页面上可见按钮文案({len(btns)}): {btns[:20]}")
+    except Exception:
+        pass
     return False
 
 

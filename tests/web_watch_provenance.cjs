@@ -33,7 +33,7 @@ function fixture() {
     let COMMENT_PAGE=1,COMMENT_PAGE_SIZE=10,DANMAKU_PAGE=1,DANMAKU_PAGE_SIZE=10;
     const selComment=new Set(),WATCH_RECORD_STATE={comment:{cache:new Map(),scope:''},danmaku:{cache:new Map(),scope:''}};
     const VIEW_REQUESTS=new Map();let VIEW_SERIAL=0;`,context);
-  for (const name of ['esc','beginViewRequest','watchBaseName','watchName','contentCaptureBounds','contentCapturedTime',
+  for (const name of ['esc','cssAttr','beginViewRequest','watchBaseName','watchName','contentCaptureBounds','contentCapturedTime',
     'watchRecordConfig','watchRecordSource','updateWatchRecordScope','populateWatchRecordSource','showWatchRecords','backToWatchTasks',
     'watchRecordSourceMarkup','watchRecordTimeMarkup','prepareWatchRecordLoad','watchRecordLoadError','cacheWatchRecordSources',
     'danmakuTime','refreshComments','refreshDanmaku','_moduleReportParams','delWatch','delDanmakuWatch'])

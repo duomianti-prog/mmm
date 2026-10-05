@@ -253,7 +253,7 @@
     await new Promise((resolve) => setTimeout(resolve, 90));
     const method = String((init && init.method) || "GET").toUpperCase();
     if (method === "GET" && url.pathname === "/api/reports/share-download-history.xlsx") {
-      return new Response("CreatorHub demo share-download history export", {
+      return new Response("mmm demo share-download history export", {
         status: 200,
         headers: {
           "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

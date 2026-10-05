@@ -315,6 +315,20 @@ class _CommentPage:
     def remove_listener(self, *_args):
         return None
 
+    async def evaluate(self, script, arg=None):
+        # 生产侧 reply-entry 流程改为页面端 JS 锚定;桩按脚本特征回执。
+        if "data-comment-id" in script:
+            return {
+                "found": bool(self.target_present),
+                "via": "cid", "reason": "no-target",
+                "nComments": 2 if self.target_present else 0,
+            }
+        if "mmm-xhs-reply" in script:
+            return {"found": False, "reason": "stub", "nCand": 0, "diag": ""}
+        if "mouseover" in script:
+            return True
+        return None
+
     def is_closed(self):
         return self.closed
 
@@ -355,7 +369,8 @@ class _Manager:
         self.visible_leases = 0
 
     @asynccontextmanager
-    async def visible_page(self, _identity, *, url=""):
+    async def visible_page(self, _identity, *, url="",
+                           keep_context=None, foreground=True):
         self.visible_leases += 1
         if url:
             self.page.url = url
@@ -494,7 +509,8 @@ class XhsBrowserWriteTests(unittest.TestCase):
 
         class BrokenManager(_Manager):
             @asynccontextmanager
-            async def visible_page(self, _identity, *, url=""):
+            async def visible_page(self, _identity, *, url="",
+                                   keep_context=None, foreground=True):
                 raise RuntimeError("fixture open failure")
                 yield  # pragma: no cover
 
@@ -642,7 +658,8 @@ class XhsBrowserWriteTests(unittest.TestCase):
 
         class SensitiveUrlManager(_Manager):
             @asynccontextmanager
-            async def visible_page(self, _identity, *, url=""):
+            async def visible_page(self, _identity, *, url="",
+                                   keep_context=None, foreground=True):
                 self.visible_leases += 1
                 self.page.url = (
                     f"{url}&token=secret-value#private-fragment")

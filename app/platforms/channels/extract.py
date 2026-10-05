@@ -72,8 +72,9 @@ def parse_channels_feed(item: dict, quality: str = "highest") -> Optional[Aweme]
 
     medias = _media_list(item)
     first_media = medias[0] if medias and isinstance(medias[0], dict) else {}
-    cover = (_first(first_media, "coverUrl", "thumbUrl", "fullCoverUrl", default="")
-             or _first(item, "coverUrl", "cover", default="") or "")
+    cover = (_first(first_media, "coverUrl", "thumbUrl", "fullCoverUrl", "cover_url",
+                    default="")
+             or _first(item, "coverUrl", "cover_url", "cover", default="") or "")
     # fileFormat / mediaType 判定图文还是视频
     mtype = "video"
     fmt = str(_first(first_media, "fileFormat", "mediaType", default="")).lower()
@@ -86,7 +87,7 @@ def parse_channels_feed(item: dict, quality: str = "highest") -> Optional[Aweme]
         aweme_id=oid,
         desc=desc,
         create_time=create_time,
-        author_name=_first(item, "nickname", "finderNickname", default="") or "",
+        author_name=_first(item, "nickname", "nickName", "finderNickname", default="") or "",
         media_type=mtype,
     )
     aw.platform = "shipinhao"
@@ -94,7 +95,8 @@ def parse_channels_feed(item: dict, quality: str = "highest") -> Optional[Aweme]
     aw.like_count = _to_int(_first(item, "likeCount", "like_count", "fav", default=0))
     aw.comment_count = _to_int(_first(item, "commentCount", "comment_count", default=0))
     dur = _to_int(_first(first_media, "videoPlayLen", "duration", default=0))
-    aw.duration = dur // 1000 if dur > 100000 else dur
+    # videoPlayLen 为毫秒;秒级取值通常 <3600(短视频),超过即按毫秒归一
+    aw.duration = dur // 1000 if dur > 3600 else dur
 
     # 尽力取可下载直链(多数情况下拿不到明文 url —— 加密 CDN,允许为空)
     for m in medias:
@@ -112,7 +114,8 @@ def parse_channels_feed(item: dict, quality: str = "highest") -> Optional[Aweme]
 
 
 def parse_channels_comment(raw: dict) -> Optional[dict]:
-    """解析一条视频号评论。返回规范化 dict 或 None。"""
+    """解析一条视频号评论。返回规范化 dict 或 None。
+    评论作者常见于嵌套 userInfo/user/author 内(nickName/headUrl),做多候选键兜底。"""
     if not isinstance(raw, dict):
         return None
     cid = str(_first(raw, "commentId", "comment_id", "id", default="") or "")
@@ -120,15 +123,28 @@ def parse_channels_comment(raw: dict) -> Optional[dict]:
         return None
     ts = _to_int(_first(raw, "createtime", "createTime", "create_time", default=0))
     create_time = ts // 1000 if ts > 10_000_000_000 else ts
+    user = _first(raw, "userInfo", "user", "author", "commentUser", default=None)
+    if not isinstance(user, dict):
+        user = {}
+    text = _first(raw, "content", "text", "commentContent", default="") or ""
+    if not isinstance(text, str):
+        text = str(text)
+    nickname = (_first(user, "nickName", "nickname", "name", default="")
+                or _first(raw, "nickname", "userName", "author_name", default="") or "")
     return {
         "comment_id": cid,
-        "text": (_first(raw, "content", "text", "commentContent", default="") or "").strip(),
-        "user_nickname": _first(raw, "nickname", "userName", "author_name", default="") or "",
+        "text": text.strip(),
+        "user_nickname": str(nickname),
         "like_count": _to_int(_first(raw, "likeCount", "like_count", default=0)),
         "create_time": create_time,
         "reply_to": str(_first(raw, "replyCommentId", "reply_to", "rootCommentId",
-                               default="") or ""),
+                               "reply_comment_id", default="") or ""),
     }
+
+
+# 子评论列表的候选键(不同 mmfinderassistant 版本命名不一)
+_SUB_COMMENT_KEYS = ("replyList", "subCommentList", "subComments", "children",
+                     "replies", "sub_comments")
 
 
 def flatten_channels_comments(root_comments: list) -> list:
@@ -138,9 +154,13 @@ def flatten_channels_comments(root_comments: list) -> list:
         if not isinstance(rc, dict):
             continue
         out.append(rc)
-        for sc in (rc.get("replyList") or rc.get("subComments") or rc.get("children") or []):
-            if isinstance(sc, dict):
-                out.append(sc)
+        for key in _SUB_COMMENT_KEYS:
+            subs = rc.get(key)
+            if isinstance(subs, list):
+                for sc in subs:
+                    if isinstance(sc, dict):
+                        out.append(sc)
+                break
     return out
 
 

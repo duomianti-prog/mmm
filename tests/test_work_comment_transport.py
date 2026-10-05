@@ -1,6 +1,7 @@
 import asyncio
 import json
 import tempfile
+import time
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,7 +19,7 @@ def _comment(cid="comment-1"):
         "cid": cid,
         "text": "fixture comment",
         "user": {"nickname": "visitor", "sec_uid": "visitor-sec"},
-        "create_time": 1_700_000_000,
+        "create_time": int(time.time()),
     }
 
 
@@ -184,6 +185,38 @@ class WorkCommentTransportTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual((result["fetched"], result["added"]), (0, 0))
         self.assertEqual(result["source"], "api")
+
+
+class LatestWorkOrderingTests(unittest.TestCase):
+    """发现评论目标时，"最近 N 个作品"必须按发布时间倒序而非列表原顺序。"""
+
+    @staticmethod
+    def _ids(items, limit=5, days=7):
+        return [it["aweme_id"]
+                for it in MonitorEngine._latest_work_items(items, limit, days)]
+
+    def test_pinned_videos_do_not_occupy_latest_window(self):
+        now = int(time.time())
+        items = [
+            {"aweme_id": "pinned-old", "create_time": now - 30 * 86400, "is_top": 1},
+            {"aweme_id": "newest", "create_time": now - 3600},
+            {"aweme_id": "two-days", "create_time": now - 2 * 86400},
+            {"aweme_id": "six-days", "create_time": now - 6 * 86400},
+            {"aweme_id": "out-window", "create_time": now - 20 * 86400},
+        ]
+        self.assertEqual(self._ids(items, 3), ["newest", "two-days", "six-days"])
+
+    def test_pinned_only_fills_remaining_slots(self):
+        now = int(time.time())
+        items = [
+            {"aweme_id": "pinned-1", "create_time": now - 9 * 86400, "is_top": 1},
+            {"aweme_id": "newest", "create_time": now - 3600},
+        ]
+        self.assertEqual(self._ids(items, 3), ["newest", "pinned-1"])
+
+    def test_missing_create_time_keeps_arrival_order_at_end(self):
+        items = [{"aweme_id": "a", "create_time": 0}, {"aweme_id": "b"}]
+        self.assertEqual(self._ids(items, 5), ["a", "b"])
 
 
 class WorkCommentUiTests(unittest.TestCase):

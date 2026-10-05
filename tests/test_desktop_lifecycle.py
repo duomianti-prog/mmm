@@ -21,7 +21,7 @@ class DesktopLifecycleTests(unittest.TestCase):
             self.assertEqual(main(), 0)
             self.assertNotIn("autostart", show.call_args.kwargs)
             self.assertFalse((Path(temp) / "browsers").exists())
-            self.assertFalse((Path(temp) / "data" / "creatorhub.db").exists())
+            self.assertFalse((Path(temp) / "data" / "mmmim.db").exists())
 
     def test_service_lock_is_independent_of_window_lock(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -116,7 +116,7 @@ def release_info(data, current):
     if data.get("draft") or data.get("prerelease") or latest is None:
         raise ValueError("Not a supported stable release")
     version = tag.removeprefix("v")
-    asset_name = f"CreatorHub-Setup-{version}-windows-x64.exe"
+    asset_name = f"mmm-Setup-{version}-windows-x64.exe"
     download_url = f"{RELEASES_URL}/download/{quote(tag, safe='')}/{asset_name}"
     asset = next((a for a in data.get("assets", []) if isinstance(a, dict)
                   and a.get("name") == asset_name and a.get("state") == "uploaded"
